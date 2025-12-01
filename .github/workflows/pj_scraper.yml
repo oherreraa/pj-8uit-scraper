@@ -1,0 +1,64 @@
+name: PJ 8UIT Scraper
+
+on:
+  # Lanzar manualmente desde la pestaña “Actions”
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    name: Extraer convocatorias <= 8 UIT (TDR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies (Tesseract + Xvfb)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-spa xvfb
+          echo "Tesseract version:"
+          tesseract --version
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium
+
+      - name: Create directories
+        run: |
+          mkdir -p data/raw data/processed captcha_images
+
+      - name: Run PJ 8UIT scraper
+        env:
+          DISPLAY: :99
+          # OPCIONAL: si quieres probar con un captcha fijo, crea un secret
+          # llamado PJ_CAPTCHA_CODE y pon el código manualmente
+          CAPTCHA_CODE: ${{ secrets.PJ_CAPTCHA_CODE }}
+          SCRAPER_TIMEOUT: 60
+        run: |
+          echo "Lanzando Xvfb..."
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 3
+
+          echo "Ejecutando scraper..."
+          python src/pj_scraper.py github
+
+      - name: Upload artifacts (JSON + captchas)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pj-8uit-results
+          path: |
+            data/
+            captcha_images/
+            *.json
+            *.png
+          retention-days: 30
