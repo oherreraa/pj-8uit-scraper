@@ -17,6 +17,14 @@ Objetivo:
     * Extraer todas las filas de la página.
     * Recorrer páginas con "Siguiente".
     * Guardar resultados en JSON (raw + procesado) para GitHub Actions.
+    * Incluir en cada fila:
+        - numero_convocatoria
+        - unidad_organica
+        - descripcion
+        - cierre_postulacion (texto original)
+        - cierre_postulacion_lima (ISO 8601 con tz America/Lima)
+        - tdr_url  (link absoluto al PDF del TDR/E.T.)
+        - detalle_url (link absoluto al "Ver" detalle)
 """
 
 import asyncio
@@ -24,9 +32,11 @@ import json
 import os
 import sys
 import io
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from zoneinfo import ZoneInfo
 from playwright.async_api import async_playwright, Page
 
 from PIL import Image, ImageOps, ImageFilter
@@ -34,6 +44,7 @@ import pytesseract
 
 
 URL = "https://sap.pj.gob.pe/portalabastecimiento-web/Convocatorias8uit"
+LIMA_TZ = ZoneInfo("America/Lima")
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +150,7 @@ async def debug_dump_page(page: Page, label: str = "after_search") -> None:
     """
     try:
         os.makedirs("data/raw", exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now(LIMA_TZ).strftime("%Y%m%d_%H%M%S")
         png_path = f"data/raw/debug_{label}_{ts}.png"
         html_path = f"data/raw/debug_{label}_{ts}.html"
 
@@ -290,7 +301,7 @@ class PJScraper:
         captcha = full.crop((left, top, right, bottom))
 
         os.makedirs("captcha_images", exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now(LIMA_TZ).strftime("%Y%m%d_%H%M%S")
         raw_path = f"captcha_images/captcha_raw_{ts}.png"
         captcha.save(raw_path)
         print(f"💾 CAPTCHA capturado en: {raw_path}")
@@ -497,6 +508,89 @@ class PJScraper:
         print("❌ No se logró pasar el CAPTCHA / obtener filas tras varios intentos.")
         return False
 
+    # -------------------------- Parsing fechas ------------------------------
+
+    def parse_cierre_postulacion(self, text: str) -> Optional[datetime]:
+        """
+        Intenta extraer una fecha/hora de cierre desde el texto recibido.
+        Devuelve un datetime con tz America/Lima o None si no se puede parsear.
+        """
+        if not text:
+            return None
+
+        text = text.strip()
+        if not text:
+            return None
+
+        # Buscar un patrón tipo DD/MM/YYYY, con o sin hora
+        m = re.search(
+            r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
+            text,
+        )
+        if not m:
+            return None
+
+        date_str = m.group(1)
+
+        # Intentar múltiples formatos
+        formatos = [
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y %H:%M",
+            "%d/%m/%Y",
+            "%d-%m-%Y %H:%M:%S",
+            "%d-%m-%Y %H:%M",
+            "%d-%m-%Y",
+        ]
+
+        for fmt in formatos:
+            try:
+                dt = datetime.strptime(date_str, fmt)
+                # Asumimos que la fecha está en hora local de Lima
+                return dt.replace(tzinfo=LIMA_TZ)
+            except ValueError:
+                continue
+
+        # Si nada funcionó
+        return None
+
+    def normalize_and_sort_convocatorias(
+        self,
+        rows: List[Dict[str, Any]],
+        run_ts: datetime,
+    ) -> List[Dict[str, Any]]:
+        """
+        - Convierte cierre_postulacion -> cierre_postulacion_lima (ISO con tz).
+        - Usa ese datetime para ordenar de la fecha más próxima a la más lejana.
+        - Estandariza fecha_extraccion en zona Lima para todas las filas.
+        """
+        for item in rows:
+            raw_cierre = (item.get("cierre_postulacion") or "").strip()
+            dt = self.parse_cierre_postulacion(raw_cierre)
+
+            if dt is not None:
+                item["cierre_postulacion_lima"] = dt.isoformat()
+                item["_sort_cierre_dt"] = dt
+            else:
+                item["cierre_postulacion_lima"] = None
+                item["_sort_cierre_dt"] = None
+
+            # Estandarizar fecha_extraccion en hora Lima (la hora del scraping)
+            item["fecha_extraccion"] = run_ts.isoformat()
+
+        # Ordenar por fecha de cierre de postulación (más próxima primero)
+        # Los que no tienen fecha parseable se van al final.
+        default_dt = datetime.max.replace(tzinfo=LIMA_TZ)
+        sorted_rows = sorted(
+            rows,
+            key=lambda x: x.get("_sort_cierre_dt") or default_dt,
+        )
+
+        # Limpiar campo interno de sort
+        for item in sorted_rows:
+            item.pop("_sort_cierre_dt", None)
+
+        return sorted_rows
+
     # -------------------------- Extracción ---------------------------------
 
     async def extract_page(self, page: Page) -> List[Dict[str, Any]]:
@@ -538,17 +632,26 @@ class PJScraper:
                     const links = row.querySelectorAll('a');
                     links.forEach(a => {
                         const txt = clean(a.textContent || '').toLowerCase();
-                        const href = a.href || '';
+                        const hrefAttr = a.getAttribute('href') || '';
+                        if (!hrefAttr) return;
 
-                        if (href && href.toLowerCase().includes('pdf')) {
-                            item.tdr_url = href;
+                        // Normalizar a URL absoluta usando window.location.origin
+                        let fullHref = hrefAttr;
+                        try {
+                            const urlObj = new URL(hrefAttr, window.location.origin);
+                            fullHref = urlObj.toString();
+                        } catch (e) {
+                            fullHref = hrefAttr;
+                        }
+
+                        if (fullHref.toLowerCase().includes('pdf')) {
+                            item.tdr_url = fullHref;
                         } else if (txt.includes('ver')) {
-                            item.detalle_url = href;
+                            item.detalle_url = fullHref;
                         }
                     });
 
                     if (item.numero_convocatoria) {
-                        item.fecha_extraccion = new Date().toISOString();
                         results.push(item);
                     }
                 });
@@ -609,7 +712,7 @@ class PJScraper:
             except Exception:
                 pass
 
-        print(f"📊 Total filas acumuladas: {len(all_rows)}")
+        print(f"📊 Total filas acumuladas (sin normalizar): {len(all_rows)}")
         return all_rows
 
     # -------------------------- Ejecución ----------------------------------
@@ -638,9 +741,10 @@ class PJScraper:
                 ok = await self.solve_and_search_with_retries(page)
                 if not ok:
                     print("❌ No se logró obtener tabla con filas tras reintentos.")
+                    now_lima = datetime.now(LIMA_TZ)
                     return {
                         "success": False,
-                        "timestamp": datetime.now().isoformat(),
+                        "timestamp": now_lima.isoformat(),
                         "source_url": self.url,
                         "total_convocatorias": 0,
                         "convocatorias": [],
@@ -648,11 +752,15 @@ class PJScraper:
                     }
 
                 # Extraer y paginar
-                rows = await self.paginate_and_extract(page)
+                rows_raw = await self.paginate_and_extract(page)
+
+                # Normalizar fechas y ordenar
+                run_ts = datetime.now(LIMA_TZ)
+                rows = self.normalize_and_sort_convocatorias(rows_raw, run_ts)
 
                 result: Dict[str, Any] = {
                     "success": True,
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": run_ts.isoformat(),
                     "source_url": self.url,
                     "total_convocatorias": len(rows),
                     "convocatorias": rows,
@@ -688,27 +796,33 @@ async def run_github() -> int:
     os.makedirs("data/raw", exist_ok=True)
     os.makedirs("data/processed", exist_ok=True)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(LIMA_TZ).strftime("%Y%m%d_%H%M%S")
 
     raw_file = f"data/raw/pj_8uit_raw_{ts}.json"
     with open(raw_file, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
+    convocatorias = result.get("convocatorias", [])
+    total = result.get("total_convocatorias", len(convocatorias))
+
     processed = {
         "metadata": {
             "source": "pj_8uit_convocatorias",
-            "extraction_timestamp": result.get("timestamp", datetime.now().isoformat()),
-            "total_records": result.get("total_convocatorias", 0),
+            "extraction_timestamp": result.get(
+                "timestamp",
+                datetime.now(LIMA_TZ).isoformat()
+            ),
+            "total_records": total,
         },
-        "convocatorias": result.get("convocatorias", []),
+        "convocatorias": convocatorias,
     }
     proc_file = f"data/processed/pj_8uit_tdr_{ts}.json"
     with open(proc_file, "w", encoding="utf-8") as f:
         json.dump(processed, f, indent=2, ensure_ascii=False)
 
     print("📁 Archivos guardados:")
-    print(f"  RAW:  {raw_file}")
-    print(f"  PROC: {proc_file}")
+    print(f"  RAW JSON:  {raw_file}")
+    print(f"  PROC JSON: {proc_file}")
 
     return 0 if result.get("success") else 1
 
