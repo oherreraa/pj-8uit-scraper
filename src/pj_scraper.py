@@ -343,7 +343,7 @@ class PJScraper:
             elif input_loc is None:
                 print("⚠️ No se encontró input de CAPTCHA.")
 
-        # Botón Buscar
+        # Botón Buscar (primer intento con Playwright)
         search_selectors = [
             'button:has-text("Buscar")',
             'input[value*="Buscar"]',
@@ -355,22 +355,56 @@ class PJScraper:
             try:
                 btn = page.locator(sel).first
                 if await btn.is_visible(timeout=3000):
+                    await btn.scroll_into_view_if_needed()
                     await btn.click()
-                    print(f"🔎 Click en botón Buscar: {sel}")
+                    print(f"🔎 Click en botón Buscar (locator): {sel}")
                     clicked = True
                     break
             except Exception:
                 continue
 
+        # Fallback: clic por DOM con evaluate en cualquier botón/input con texto "Buscar"
         if not clicked:
-            print("⚠️ No se encontró botón Buscar, se continúa con la página actual.")
+            print("⚠️ Locator no pudo hacer clic; intentando DOM click via evaluate...")
+            try:
+                clicked = await page.evaluate(
+                    """
+                    () => {
+                        const elements = Array.from(
+                            document.querySelectorAll('button, input[type="button"], input[type="submit"]')
+                        );
+                        for (const el of elements) {
+                            const text = (el.innerText || el.value || '').trim().toLowerCase();
+                            if (text.includes('buscar')) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    """
+                )
+                if clicked:
+                    print("🔎 Click en botón Buscar (DOM evaluate).")
+                else:
+                    print("❌ No se encontró ningún botón 'Buscar' via DOM.")
+            except Exception as e:
+                print(f"❌ Error en DOM click de Buscar: {e}")
+                clicked = False
+
+        if not clicked:
+            print("⚠️ No se logró hacer clic en Buscar. Dump de debug...")
             await debug_dump_page(page, label="no_search_button")
             return
 
+        # Esperar a que se procese la búsqueda
         try:
             await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
         except Exception:
             pass
+
+        # Pequeña espera adicional para que cargue la tabla vía JS/XHR
+        await asyncio.sleep(3)
 
         try:
             await page.wait_for_selector("table, tbody tr", timeout=self.timeout_ms)
@@ -402,7 +436,12 @@ class PJScraper:
                     return t ? t.trim().replace(/\\s+/g, ' ') : '';
                 }
 
-                const rows = document.querySelectorAll('table tbody tr');
+                // Intento amplio de selección de filas
+                let rows = Array.from(document.querySelectorAll('table tbody tr'));
+                if (!rows.length) {
+                    rows = Array.from(document.querySelectorAll('tbody tr'));
+                }
+
                 rows.forEach(row => {
                     const cells = row.querySelectorAll('td');
                     if (cells.length < 4) return;
