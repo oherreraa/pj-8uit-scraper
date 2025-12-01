@@ -8,22 +8,22 @@ Objetivo:
 - Capturar la imagen del CAPTCHA y resolverla con Tesseract (OCR avanzado),
   o usar un código fijo si viene por variable de entorno.
 - Escribir el CAPTCHA en el input.
-- Hacer clic en "Buscar".
-- Extraer todas las filas de la tabla de convocatorias, incluyendo:
-    * N° de Convocatoria
-    * Unidad Orgánica
-    * Descripción
-    * Cierre de Postulación
-    * URL del TDR/E.T. (PDF)
-    * URL del botón "Ver"
-- Recorrer páginas con "Siguiente" (si existen).
-- Guardar resultados en JSON (raw + procesado) para GitHub Actions.
+- Hacer clic en "Buscar" (con fallback via DOM).
+- Verificar si:
+    * el CAPTCHA fue incorrecto (mensaje en la página), o
+    * se cargó la tabla con filas de convocatorias.
+- Si el CAPTCHA falló, reintentar varias veces (recargando página y nuevo CAPTCHA).
+- Cuando se obtenga una tabla con filas válidas:
+    * Extraer todas las filas de la página.
+    * Recorrer páginas con "Siguiente".
+    * Guardar resultados en JSON (raw + procesado) para GitHub Actions.
 """
 
 import asyncio
 import json
 import os
 import sys
+import io
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -31,7 +31,6 @@ from playwright.async_api import async_playwright, Page
 
 from PIL import Image, ImageOps, ImageFilter
 import pytesseract
-import io
 
 
 URL = "https://sap.pj.gob.pe/portalabastecimiento-web/Convocatorias8uit"
@@ -167,6 +166,7 @@ class PJScraper:
         timeout: int = 60,
         captcha_code: Optional[str] = None,
         max_pages: int = 30,
+        max_captcha_attempts: int = 5,
         use_tesseract: bool = True,
     ) -> None:
         self.base_url = "https://sap.pj.gob.pe/portalabastecimiento-web"
@@ -175,6 +175,7 @@ class PJScraper:
         self.timeout_ms = timeout * 1000
         self.captcha_code = captcha_code
         self.max_pages = max_pages
+        self.max_captcha_attempts = max_captcha_attempts
         self.use_tesseract = use_tesseract
 
         self.headers = {
@@ -296,8 +297,13 @@ class PJScraper:
 
         return captcha
 
-    async def fill_captcha_and_click_search(self, page: Page) -> None:
-        """Resolver CAPTCHA (si existe), rellenar input y pulsar Buscar."""
+    async def fill_captcha_and_click_search_once(self, page: Page, attempt: int) -> None:
+        """
+        Resolver CAPTCHA (si existe), rellenar input y pulsar Buscar.
+        SOLO UN INTENTO; el bucle de reintentos está en solve_and_search_with_retries().
+        """
+        print(f"🎯 Intento de búsqueda con CAPTCHA #{attempt}")
+
         if not await self.has_captcha(page):
             print("ℹ️ No se detectó CAPTCHA, continuando sin resolverlo.")
         else:
@@ -316,7 +322,7 @@ class PJScraper:
             if not captcha_text:
                 print(
                     "⚠️ No se obtuvo texto de CAPTCHA. "
-                    "En modo headless podría fallar la búsqueda."
+                    "Es probable que la búsqueda falle."
                 )
 
             input_loc = None
@@ -394,7 +400,7 @@ class PJScraper:
 
         if not clicked:
             print("⚠️ No se logró hacer clic en Buscar. Dump de debug...")
-            await debug_dump_page(page, label="no_search_button")
+            await debug_dump_page(page, label=f"no_search_button_attempt_{attempt}")
             return
 
         # Esperar a que se procese la búsqueda
@@ -406,14 +412,90 @@ class PJScraper:
         # Pequeña espera adicional para que cargue la tabla vía JS/XHR
         await asyncio.sleep(3)
 
-        try:
-            await page.wait_for_selector("table, tbody tr", timeout=self.timeout_ms)
-            print("📄 Tabla de resultados visible tras Buscar.")
-        except Exception:
-            print("⚠️ No se detectó tabla tras Buscar (puede ser error de CAPTCHA).")
+        # Dump de la página tras este intento (para análisis)
+        await debug_dump_page(page, label=f"after_search_attempt_{attempt}")
 
-        # Dump siempre después de Buscar, para ver qué devolvió el portal
-        await debug_dump_page(page, label="after_search")
+    async def check_search_result_status(self, page: Page) -> str:
+        """
+        Analiza el DOM después de Buscar y clasifica el estado:
+          - "ok": hay tabla con filas de convocatorias
+          - "captcha_error": mensaje típico de error de captcha
+          - "empty": sin filas válidas (tabla vacía u otro mensaje)
+        """
+        status = await page.evaluate(
+            """
+            () => {
+                function bodyHas(text) {
+                    if (!document.body) return false;
+                    return document.body.innerText.toLowerCase().includes(text.toLowerCase());
+                }
+
+                // Mensajes típicos de error de captcha
+                if (bodyHas("captcha incorrecto") ||
+                    bodyHas("código captcha incorrecto") ||
+                    bodyHas("codigo captcha incorrecto") ||
+                    bodyHas("ingrese el código") ||
+                    bodyHas("ingrese codigo") ||
+                    bodyHas("código captcha") ) {
+                    return "captcha_error";
+                }
+
+                // Contar filas con datos en alguna tabla
+                let rows = Array.from(document.querySelectorAll("table tbody tr"));
+                if (!rows.length) {
+                    rows = Array.from(document.querySelectorAll("tbody tr"));
+                }
+
+                let dataRows = 0;
+                for (const r of rows) {
+                    const cells = r.querySelectorAll("td");
+                    if (cells.length >= 3) {
+                        const c0 = (cells[0].innerText || "").trim();
+                        const c1 = (cells[1].innerText || "").trim();
+                        if (c0 && c1) {
+                            dataRows++;
+                        }
+                    }
+                }
+
+                if (dataRows > 0) return "ok";
+                return "empty";
+            }
+            """
+        )
+
+        print(f"🔍 Estado detectado tras Buscar: {status}")
+        return status
+
+    async def solve_and_search_with_retries(self, page: Page) -> bool:
+        """
+        Reintenta resolver el CAPTCHA y hacer Buscar hasta que:
+          - Se detecten filas de convocatorias ("ok"), o
+          - Se agoten los max_captcha_attempts.
+        En cada intento se recarga la página para forzar nuevo CAPTCHA.
+        """
+        for attempt in range(1, self.max_captcha_attempts + 1):
+            if attempt > 1:
+                print("🔄 Re-cargando página para nuevo intento de CAPTCHA...")
+                await page.goto(self.url, timeout=self.timeout_ms)
+                await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
+                await self.handle_overlays(page)
+
+            await self.fill_captcha_and_click_search_once(page, attempt)
+
+            status = await self.check_search_result_status(page)
+
+            if status == "ok":
+                print("✅ Búsqueda con CAPTCHA exitosa, se encontró tabla con filas.")
+                return True
+            elif status == "captcha_error":
+                print("⚠️ Error de CAPTCHA detectado, se reintentará si hay intentos disponibles.")
+            else:
+                # "empty": puede ser tabla vacía o mensaje extraño
+                print("ℹ️ No se detectaron filas válidas; se considera intento fallido.")
+
+        print("❌ No se logró pasar el CAPTCHA / obtener filas tras varios intentos.")
+        return False
 
     # -------------------------- Extracción ---------------------------------
 
@@ -552,8 +634,18 @@ class PJScraper:
                 await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
                 await self.handle_overlays(page)
 
-                # Resolver captcha + Buscar
-                await self.fill_captcha_and_click_search(page)
+                # Resolver captcha + Buscar con reintentos
+                ok = await self.solve_and_search_with_retries(page)
+                if not ok:
+                    print("❌ No se logró obtener tabla con filas tras reintentos.")
+                    return {
+                        "success": False,
+                        "timestamp": datetime.now().isoformat(),
+                        "source_url": self.url,
+                        "total_convocatorias": 0,
+                        "convocatorias": [],
+                        "error": "No se logró pasar CAPTCHA / obtener filas tras reintentos",
+                    }
 
                 # Extraer y paginar
                 rows = await self.paginate_and_extract(page)
@@ -589,6 +681,7 @@ async def run_github() -> int:
         timeout=timeout_val,
         captcha_code=captcha_code,
         use_tesseract=True,
+        max_captcha_attempts=5,
     )
     result = await scraper.run()
 
@@ -604,10 +697,10 @@ async def run_github() -> int:
     processed = {
         "metadata": {
             "source": "pj_8uit_convocatorias",
-            "extraction_timestamp": result["timestamp"],
-            "total_records": result["total_convocatorias"],
+            "extraction_timestamp": result.get("timestamp", datetime.now().isoformat()),
+            "total_records": result.get("total_convocatorias", 0),
         },
-        "convocatorias": result["convocatorias"],
+        "convocatorias": result.get("convocatorias", []),
     }
     proc_file = f"data/processed/pj_8uit_tdr_{ts}.json"
     with open(proc_file, "w", encoding="utf-8") as f:
@@ -627,6 +720,7 @@ async def run_local() -> None:
         timeout=90,
         captcha_code=None,  # o un código fijo para probar
         use_tesseract=True,
+        max_captcha_attempts=5,
     )
     result = await scraper.run()
     print(json.dumps(result, indent=2, ensure_ascii=False))
