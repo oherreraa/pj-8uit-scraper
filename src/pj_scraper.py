@@ -4,14 +4,20 @@ PJ 8UIT Scraper
 
 Objetivo:
 - Abrir https://sap.pj.gob.pe/portalabastecimiento-web/Convocatorias8uit
-- Detectar CAPTCHA por DOM, capturar imagen y resolver con Tesseract
-  (o usar un código fijo vía variable de entorno).
+- Detectar CAPTCHA vía DOM.
+- Capturar la imagen del CAPTCHA y resolverla con Tesseract (OCR avanzado),
+  o usar un código fijo si viene por variable de entorno.
 - Escribir el CAPTCHA en el input.
 - Hacer clic en "Buscar".
-- Extraer todas las filas de la tabla de convocatorias, incluyendo
-  los links de TDR/E.T. (PDF) y el link "Ver".
+- Extraer todas las filas de la tabla de convocatorias, incluyendo:
+    * N° de Convocatoria
+    * Unidad Orgánica
+    * Descripción
+    * Cierre de Postulación
+    * URL del TDR/E.T. (PDF)
+    * URL del botón "Ver"
 - Recorrer páginas con "Siguiente" (si existen).
-- Guardar resultados en JSON (raw + procesado).
+- Guardar resultados en JSON (raw + procesado) para GitHub Actions.
 """
 
 import asyncio
@@ -23,10 +29,136 @@ from typing import Any, Dict, List, Optional
 
 from playwright.async_api import async_playwright, Page
 
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 import pytesseract
 import io
 
+
+URL = "https://sap.pj.gob.pe/portalabastecimiento-web/Convocatorias8uit"
+
+
+# ---------------------------------------------------------------------------
+# Utilidades de OCR / debug
+# ---------------------------------------------------------------------------
+
+def _clean_text(text: str) -> str:
+    """Limpia el texto devuelto por Tesseract."""
+    return "".join(c for c in text if c.isalnum()).upper()
+
+
+def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
+    """
+    Versión avanzada de OCR:
+    - Diversos preprocesados.
+    - Varias configuraciones Tesseract.
+    - Elige la mejor cadena según heurística simple.
+    """
+
+    configs = [
+        (
+            "psm8_whitelist",
+            "--oem 3 --psm 8 -l eng "
+            "-c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        ),
+        (
+            "psm7_whitelist",
+            "--oem 3 --psm 7 -l eng "
+            "-c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        ),
+        (
+            "psm6_whitelist",
+            "--oem 3 --psm 6 -l eng "
+            "-c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        ),
+        ("psm8_no_whitelist", "--oem 3 --psm 8 -l eng"),
+    ]
+
+    variants: List[tuple[str, Image.Image]] = []
+
+    base_gray = image.convert("L")
+    variants.append(("gray", base_gray))
+
+    for scale in (2, 3, 4):
+        w, h = base_gray.size
+        resized = base_gray.resize((w * scale, h * scale))
+        variants.append((f"gray_x{scale}", resized))
+
+        for thr in (120, 140, 160, 180):
+            bin_im = resized.point(lambda x, t=thr: 0 if x < t else 255, "1")
+            variants.append((f"bin_x{scale}_thr{thr}", bin_im))
+
+        inv = ImageOps.invert(resized)
+        inv = inv.filter(ImageFilter.MedianFilter(size=3))
+        variants.append((f"invert_med_x{scale}", inv))
+
+    attempts: List[tuple[str, str]] = []
+
+    for v_name, img_v in variants:
+        for cfg_name, cfg in configs:
+            desc = f"{v_name} | {cfg_name}"
+            try:
+                raw = pytesseract.image_to_string(img_v, config=cfg)
+                clean = _clean_text(raw)
+                attempts.append((desc, clean))
+            except Exception as e:
+                attempts.append((desc, f"ERROR:{e}"))
+
+    print("📜 Intentos de OCR:")
+    for desc, txt in attempts:
+        if txt.startswith("ERROR:"):
+            print(f"  [{desc}] -> {txt}")
+        else:
+            print(f"  [{desc}] -> '{txt}' (len={len(txt)})")
+
+    best = ""
+    # Preferimos cadenas de longitud 4–6 (tamaño típico de captcha)
+    for desc, txt in attempts:
+        if 4 <= len(txt) <= 6 and not txt.startswith("ERROR:"):
+            best = txt
+            break
+
+    if not best:
+        # Si no hay nada de longitud adecuada, elegimos la no vacía más larga
+        candidates = [
+            txt for _, txt in attempts if txt and not txt.startswith("ERROR:")
+        ]
+        if candidates:
+            best = max(candidates, key=len)
+
+    if best:
+        print(f"✅ Mejor resultado OCR: '{best}'")
+        return best
+
+    print("❌ No se obtuvo un resultado OCR usable.")
+    return None
+
+
+async def debug_dump_page(page: Page, label: str = "after_search") -> None:
+    """
+    Guardar screenshot + HTML de la página para debug.
+    Útil para ver qué mensaje devuelve el portal cuando falla el CAPTCHA.
+    """
+    try:
+        os.makedirs("data/raw", exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        png_path = f"data/raw/debug_{label}_{ts}.png"
+        html_path = f"data/raw/debug_{label}_{ts}.html"
+
+        await page.screenshot(path=png_path, full_page=True)
+        html = await page.content()
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+        print("🧪 Debug dump guardado:")
+        print(f"   PNG:  {png_path}")
+        print(f"   HTML: {html_path}")
+    except Exception as e:
+        print(f"⚠️ Error en debug_dump_page: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Clase principal del scraper
+# ---------------------------------------------------------------------------
 
 class PJScraper:
     def __init__(
@@ -55,19 +187,15 @@ class PJScraper:
             "Accept-Language": "es-PE,es;q=0.9,en;q=0.8",
         }
 
-    # -------------------------------------------------------------------------
-    # Setup / utilidades
-    # -------------------------------------------------------------------------
+    # ----------------------------- Setup -----------------------------------
 
     async def setup_page(self, page: Page) -> None:
         await page.set_viewport_size({"width": 1920, "height": 1080})
         await page.set_extra_http_headers(self.headers)
 
-        # Cerrar popups / diálogos
         page.on("popup", lambda popup: asyncio.create_task(popup.close()))
         page.on("dialog", lambda dialog: asyncio.create_task(dialog.accept()))
 
-        # Anti-detección mínima
         await page.add_init_script(
             """
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -83,7 +211,6 @@ class PJScraper:
                 ".dialog:visible",
                 '[role="dialog"]:visible',
             ]
-
             for sel in modal_selectors:
                 try:
                     loc = page.locator(sel).first
@@ -100,7 +227,6 @@ class PJScraper:
                 ".cookie-accept",
                 ".accept-cookies",
             ]
-
             for sel in cookie_selectors:
                 try:
                     btn = page.locator(sel).first
@@ -110,12 +236,11 @@ class PJScraper:
                         break
                 except Exception:
                     continue
+
         except Exception as e:
             print(f"⚠️ Error manejando overlays: {e}")
 
-    # -------------------------------------------------------------------------
-    # CAPTCHA: detección DOM + captura + Tesseract
-    # -------------------------------------------------------------------------
+    # --------------------------- CAPTCHA -----------------------------------
 
     async def locate_captcha_img(self, page: Page):
         selectors = [
@@ -131,10 +256,11 @@ class PJScraper:
             try:
                 img = page.locator(sel).first
                 if await img.is_visible(timeout=3000):
-                    print(f"🤖 CAPTCHA detectado: {sel}")
+                    print(f"🤖 CAPTCHA encontrado con selector: {sel}")
                     return img
             except Exception:
                 continue
+        print("ℹ️ No se encontró imagen de CAPTCHA.")
         return None
 
     async def has_captcha(self, page: Page) -> bool:
@@ -142,100 +268,57 @@ class PJScraper:
         return img is not None
 
     async def capture_captcha_image(self, page: Page) -> Optional[Image.Image]:
-        try:
-            img = await self.locate_captcha_img(page)
-            if img is None:
-                print("❌ No se encontró imagen de CAPTCHA.")
-                return None
-
-            bbox = await img.bounding_box()
-            if not bbox:
-                print("❌ No se pudo obtener bounding box.")
-                return None
-
-            screenshot_bytes = await page.screenshot()
-            full_img = Image.open(io.BytesIO(screenshot_bytes))
-
-            padding = 4
-            left = max(0, int(bbox["x"] - padding))
-            top = max(0, int(bbox["y"] - padding))
-            right = min(full_img.width, int(bbox["x"] + bbox["width"] + padding))
-            bottom = min(full_img.height, int(bbox["y"] + bbox["height"] + padding))
-
-            captcha = full_img.crop((left, top, right, bottom))
-
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            os.makedirs("captcha_images", exist_ok=True)
-            raw_path = f"captcha_images/captcha_raw_{ts}.png"
-            captcha.save(raw_path)
-            print(f"💾 CAPTCHA capturado en: {raw_path}")
-
-            return captcha
-        except Exception as e:
-            print(f"❌ Error capturando CAPTCHA: {e}")
+        img = await self.locate_captcha_img(page)
+        if img is None:
             return None
 
-    def solve_captcha_tesseract(self, image: Image.Image) -> Optional[str]:
-        try:
-            print("👁️ Resolviendo CAPTCHA con Tesseract...")
-
-            img = image.convert("L")
-            w, h = img.size
-            if w < 120 or h < 40:
-                img = img.resize((w * 3, h * 3))
-
-            # Binarización muy simple
-            img = img.point(lambda x: 0 if x < 140 else 255, "1")
-
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            processed_path = f"captcha_images/captcha_processed_{ts}.png"
-            img.convert("L").save(processed_path)
-            print(f"🔧 CAPTCHA procesado guardado en: {processed_path}")
-
-            config = (
-                "--oem 3 --psm 8 "
-                "-c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-            )
-            text = pytesseract.image_to_string(img, config=config)
-            if not text:
-                print("❌ Tesseract no devolvió texto.")
-                return None
-
-            clean = "".join(c for c in text if c.isalnum()).upper()
-            if 3 <= len(clean) <= 8:
-                print(f"✅ CAPTCHA resuelto: '{clean}'")
-                return clean
-
-            print(f"⚠️ Resultado OCR dudoso: '{clean}'")
+        bbox = await img.bounding_box()
+        if not bbox:
+            print("❌ No se pudo obtener bounding box del CAPTCHA.")
             return None
-        except Exception as e:
-            print(f"❌ Error en Tesseract: {e}")
-            return None
+
+        screenshot_bytes = await page.screenshot()
+        full = Image.open(io.BytesIO(screenshot_bytes))
+
+        padding = 4
+        left = max(0, int(bbox["x"] - padding))
+        top = max(0, int(bbox["y"] - padding))
+        right = min(full.width, int(bbox["x"] + bbox["width"] + padding))
+        bottom = min(full.height, int(bbox["y"] + bbox["height"] + padding))
+
+        captcha = full.crop((left, top, right, bottom))
+
+        os.makedirs("captcha_images", exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        raw_path = f"captcha_images/captcha_raw_{ts}.png"
+        captcha.save(raw_path)
+        print(f"💾 CAPTCHA capturado en: {raw_path}")
+
+        return captcha
 
     async def fill_captcha_and_click_search(self, page: Page) -> None:
-        """Intentar resolver CAPTCHA y hacer clic en 'Buscar'."""
+        """Resolver CAPTCHA (si existe), rellenar input y pulsar Buscar."""
         if not await self.has_captcha(page):
-            print("ℹ️ No se detectó CAPTCHA. Se continúa sin ingresarlo.")
+            print("ℹ️ No se detectó CAPTCHA, continuando sin resolverlo.")
         else:
             captcha_text: Optional[str] = None
 
-            # 1) Código fijo vía env / parámetro
+            # 1) Código fijo vía entorno / secrets
             if self.captcha_code:
                 captcha_text = self.captcha_code.strip()
                 print(f"🔑 Usando CAPTCHA fijo: '{captcha_text}'")
-            # 2) OCR con Tesseract
+            # 2) OCR avanzado con Tesseract
             elif self.use_tesseract:
                 img = await self.capture_captcha_image(page)
                 if img is not None:
-                    captcha_text = self.solve_captcha_tesseract(img)
+                    captcha_text = solve_captcha_tesseract_advanced(img)
 
             if not captcha_text:
                 print(
                     "⚠️ No se obtuvo texto de CAPTCHA. "
-                    "En GitHub Actions puede fallar el submit."
+                    "En modo headless podría fallar la búsqueda."
                 )
 
-            # Buscar input de captcha
             input_loc = None
             input_selectors = [
                 'input[name*="captcha"]',
@@ -256,7 +339,7 @@ class PJScraper:
             if input_loc is not None and captcha_text:
                 await input_loc.fill("")
                 await input_loc.type(captcha_text, delay=80)
-                print("✅ CAPTCHA escrito en input.")
+                print("✅ CAPTCHA escrito en el input.")
             elif input_loc is None:
                 print("⚠️ No se encontró input de CAPTCHA.")
 
@@ -280,7 +363,8 @@ class PJScraper:
                 continue
 
         if not clicked:
-            print("⚠️ No se encontró botón Buscar. Se sigue con la página actual.")
+            print("⚠️ No se encontró botón Buscar, se continúa con la página actual.")
+            await debug_dump_page(page, label="no_search_button")
             return
 
         try:
@@ -292,13 +376,15 @@ class PJScraper:
             await page.wait_for_selector("table, tbody tr", timeout=self.timeout_ms)
             print("📄 Tabla de resultados visible tras Buscar.")
         except Exception:
-            print("⚠️ No se detectó tabla tras Buscar (puede que no haya resultados).")
+            print("⚠️ No se detectó tabla tras Buscar (puede ser error de CAPTCHA).")
 
-    # -------------------------------------------------------------------------
-    # Extracción de tabla + paginación
-    # -------------------------------------------------------------------------
+        # Dump siempre después de Buscar, para ver qué devolvió el portal
+        await debug_dump_page(page, label="after_search")
+
+    # -------------------------- Extracción ---------------------------------
 
     async def extract_page(self, page: Page) -> List[Dict[str, Any]]:
+        """Extraer las filas de la tabla de la página actual."""
         print("📊 Extrayendo filas de la página actual...")
         try:
             await page.wait_for_selector("table, tbody tr", timeout=self.timeout_ms)
@@ -308,7 +394,7 @@ class PJScraper:
 
         await self.handle_overlays(page)
 
-        data = await page.evaluate(
+        data: List[Dict[str, Any]] = await page.evaluate(
             """
             () => {
                 const results = [];
@@ -355,13 +441,14 @@ class PJScraper:
         return data
 
     async def paginate_and_extract(self, page: Page) -> List[Dict[str, Any]]:
+        """Recorrer páginas usando 'Siguiente' y acumular filas."""
         all_rows: List[Dict[str, Any]] = []
+
         for idx in range(self.max_pages):
             print(f"📄 Página {idx + 1}/{self.max_pages}")
             rows = await self.extract_page(page)
             all_rows.extend(rows)
 
-            # Buscar botón "Siguiente"
             next_selectors = [
                 'a[aria-label*="Siguiente"]',
                 'button[aria-label*="Siguiente"]',
@@ -404,9 +491,7 @@ class PJScraper:
         print(f"📊 Total filas acumuladas: {len(all_rows)}")
         return all_rows
 
-    # -------------------------------------------------------------------------
-    # Scraping principal
-    # -------------------------------------------------------------------------
+    # -------------------------- Ejecución ----------------------------------
 
     async def run(self) -> Dict[str, Any]:
         print("🚀 Iniciando scraper PJ 8UIT...")
@@ -448,9 +533,9 @@ class PJScraper:
                 await browser.close()
 
 
-# -------------------------------------------------------------------------
-# Helpers para GitHub Actions y pruebas locales
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Wrappers para GitHub Actions y pruebas locales
+# ---------------------------------------------------------------------------
 
 async def run_github() -> int:
     captcha_code = os.getenv("CAPTCHA_CODE") or os.getenv("PJ_CAPTCHA")
@@ -477,7 +562,6 @@ async def run_github() -> int:
     with open(raw_file, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
-    # Procesado: solo lista limpia de convocatorias y campos clave
     processed = {
         "metadata": {
             "source": "pj_8uit_convocatorias",
@@ -494,16 +578,15 @@ async def run_github() -> int:
     print(f"  RAW:  {raw_file}")
     print(f"  PROC: {proc_file}")
 
-    # Exit code
     return 0 if result.get("success") else 1
 
 
 async def run_local() -> None:
-    """Modo debug local (abre navegador visible si quieres)."""
+    """Modo debug local (abre navegador visible)."""
     scraper = PJScraper(
         headless=False,
         timeout=90,
-        captcha_code=None,   # O poner aquí un código fijo para probar
+        captcha_code=None,  # o un código fijo para probar
         use_tesseract=True,
     )
     result = await scraper.run()
