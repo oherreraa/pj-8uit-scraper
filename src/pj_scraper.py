@@ -20,7 +20,9 @@ Objetivo:
         - Intentar localizar el elemento que descarga el TDR.
         - Usar page.expect_download() para capturar el PDF.
         - Extraer el bloque "CARACTERISTICAS TECNICAS" del PDF.
-    * Guardar resultados en JSON (raw + procesado) para GitHub Actions.
+        - Si no se encuentra con texto embebido:
+            -> activar OCR sobre el PDF y volver a buscar el capítulo.
+    * Emitir UN SOLO JSON "procesado" para GitHub Actions (data/processed/*.json).
     * En cada fila dejar:
         - numero_convocatoria
         - unidad_organica
@@ -29,6 +31,7 @@ Objetivo:
         - cierre_postulacion_lima (ISO 8601 con tz America/Lima)
         - tdr_filename (nombre del PDF descargado, si se logró)
         - caracteristicas_tecnicas (bloque extraído del PDF, si se logró)
+        - caracteristicas_tecnicas_ocr (bool: True si se usó OCR)
 """
 
 import asyncio
@@ -37,8 +40,11 @@ import os
 import sys
 import io
 import re
+import subprocess
+import glob
+import tempfile
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from zoneinfo import ZoneInfo
 from playwright.async_api import async_playwright, Page
@@ -146,56 +152,65 @@ def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
     return None
 
 
-def extract_caracteristicas_from_pdf(pdf_path: str) -> Optional[str]:
+def ocr_pdf_to_text(pdf_path: str) -> str:
     """
-    Extrae el bloque de texto correspondiente a "CARACTERISTICAS TECNICAS"
-    (tolerando variantes con tilde) desde el PDF.
-
-    Retorna un string con ese bloque, recortado a un tamaño razonable.
+    Convierte el PDF completo a imágenes (pdftoppm) y les aplica OCR (pytesseract).
+    Retorna texto concatenado de todas las páginas OCR.
     """
-    try:
-        reader = PdfReader(pdf_path)
-    except Exception as e:
-        print(f"⚠️ No se pudo abrir PDF '{pdf_path}': {e}")
-        return None
-
     texts: List[str] = []
-    for i, page in enumerate(reader.pages):
-        try:
-            t = page.extract_text() or ""
-        except Exception:
-            t = ""
-        if t.strip():
-            texts.append(t)
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prefix = os.path.join(tmpdir, "page")
+            # Requiere poppler-utils (pdftoppm)
+            subprocess.run(
+                ["pdftoppm", "-png", pdf_path, prefix],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            png_files = sorted(glob.glob(os.path.join(tmpdir, "page-*.png")))
+            for png in png_files:
+                try:
+                    img = Image.open(png).convert("L")
+                    img = img.filter(ImageFilter.MedianFilter(size=3))
+                    txt = pytesseract.image_to_string(img, lang="spa+eng")
+                    if txt.strip():
+                        texts.append(txt)
+                except Exception as e:
+                    print(f"⚠️ Error OCR en página {png}: {e}")
+    except Exception as e:
+        print(f"⚠️ Error en pipeline pdftoppm/OCR: {e}")
 
-    if not texts:
-        print(f"⚠️ PDF sin texto legible: {pdf_path}")
+    return "\n".join(texts).strip()
+
+
+def _extract_caracteristicas_from_text(full_text: str) -> Optional[str]:
+    """
+    Busca el capítulo de CARACTERÍSTICAS / ESPECIFICACIONES TÉCNICAS
+    en un texto plano de todo el PDF. Devuelve el bloque o None.
+    """
+    if not full_text:
         return None
 
-    full_text = "\n".join(texts)
-    normalized = full_text.upper()
+    norm = full_text.upper()
 
+    # Encabezados típicos
     patterns = [
-        "CARACTERISTICAS TECNICAS",
-        "CARACTERÍSTICAS TÉCNICAS",
-        "CARACTERISTICAS TÉCNICAS",
-        "CARACTERÍSTICAS TECNICAS",
+        r"CARACTER[IÍ]STICAS\s+T[ÉE]CNICAS",
+        r"ESPECIFICACIONES\s+T[ÉE]CNICAS",
     ]
 
     start_idx = -1
-    chosen = ""
-    for p in patterns:
-        pos = normalized.find(p)
-        if pos != -1:
-            start_idx = pos
-            chosen = p
+    for pat in patterns:
+        m = re.search(pat, norm)
+        if m:
+            start_idx = m.start()
             break
 
     if start_idx == -1:
-        print(f"ℹ️ No se encontró encabezado 'CARACTERISTICAS TECNICAS' en {pdf_path}")
         return None
 
-    # Buscar posible sección siguiente que marque el fin del bloque
+    # Posibles marcadores de fin de sección
     end_markers = [
         "CONDICIONES GENERALES",
         "CONDICIONES CONTRACTUALES",
@@ -212,17 +227,67 @@ def extract_caracteristicas_from_pdf(pdf_path: str) -> Optional[str]:
 
     end_idx = len(full_text)
     for m in end_markers:
-        pos = normalized.find(m, start_idx + len(chosen))
+        pos = norm.find(m, start_idx + 10)
         if pos != -1 and pos > start_idx:
             end_idx = min(end_idx, pos)
 
     segment = full_text[start_idx:end_idx].strip()
-    # Limitar el tamaño para que no sea gigantesco
+    if not segment:
+        return None
+
     max_len = 4000
     if len(segment) > max_len:
         segment = segment[:max_len] + "\n[...]"
 
     return segment
+
+
+def extract_caracteristicas_from_pdf(pdf_path: str) -> Tuple[Optional[str], bool]:
+    """
+    Extrae el capítulo de CARACTERISTICAS TECNICAS con 2 etapas:
+
+    1) Lectura por texto embebido (PyPDF2).
+       - Si encuentra el capítulo → devuelve (texto, False).
+
+    2) Si no se encontró, activa OCR (pdftoppm + Tesseract).
+       - Si encuentra el capítulo → devuelve (texto, True).
+       - Si no → (None, True) para indicar que se intentó OCR.
+    """
+    # --- Etapa 1: PyPDF2 (texto embebido) ---
+    try:
+        reader = PdfReader(pdf_path)
+    except Exception as e:
+        print(f"⚠️ No se pudo abrir PDF '{pdf_path}': {e}")
+        return None, False
+
+    pages_text: List[str] = []
+    for i, page in enumerate(reader.pages):
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        if t.strip():
+            pages_text.append(t)
+
+    full_text = "\n".join(pages_text)
+    # Buscar capítulo en texto embebido
+    segment_plain = _extract_caracteristicas_from_text(full_text)
+    if segment_plain:
+        return segment_plain, False
+
+    # --- Etapa 2: OCR completo del PDF ---
+    print(f"ℹ️ No se encontró capítulo 'CARACTERISTICAS TECNICAS' con texto embebido. Activando OCR para {pdf_path}...")
+    ocr_text = ocr_pdf_to_text(pdf_path)
+    if not ocr_text:
+        print("⚠️ OCR no devolvió texto util.")
+        return None, True
+
+    segment_ocr = _extract_caracteristicas_from_text(ocr_text)
+    if segment_ocr:
+        return segment_ocr, True
+
+    print("⚠️ OCR ejecutado, pero no se encontró capítulo específico de características técnicas.")
+    return None, True
 
 
 async def debug_dump_page(page: Page, label: str = "after_search") -> None:
@@ -452,553 +517,7 @@ class PJScraper:
                     clicked = True
                     break
             except Exception:
-                continue
+           
 
-        if not clicked:
-            print("⚠️ Locator no pudo hacer clic; intentando DOM click via evaluate...")
-            try:
-                clicked = await page.evaluate(
-                    """
-                    () => {
-                        const elements = Array.from(
-                            document.querySelectorAll('button, input[type="button"], input[type="submit"]')
-                        );
-                        for (const el of elements) {
-                            const text = (el.innerText || el.value || '').trim().toLowerCase();
-                            if (text.includes('buscar')) {
-                                el.click();
-                                return true;
-                            }
-                        }
-                        return false;
-                    }
-                    """
-                )
-                if clicked:
-                    print("🔎 Click en botón Buscar (DOM evaluate).")
-                else:
-                    print("❌ No se encontró ningún botón 'Buscar' via DOM.")
-            except Exception as e:
-                print(f"❌ Error en DOM click de Buscar: {e}")
-                clicked = False
 
-        if not clicked:
-            print("⚠️ No se logró hacer clic en Buscar. Dump de debug...")
-            await debug_dump_page(page, label=f"no_search_button_attempt_{attempt}")
-            return
-
-        try:
-            await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
-        except Exception:
-            pass
-
-        await asyncio.sleep(3)
-        await debug_dump_page(page, label=f"after_search_attempt_{attempt}")
-
-    async def check_search_result_status(self, page: Page) -> str:
-        """
-        Clasifica el estado tras Buscar:
-          - "ok": hay tabla con filas
-          - "captcha_error": mensaje de error de captcha
-          - "empty": sin filas válidas
-        """
-        status = await page.evaluate(
-            """
-            () => {
-                function bodyHas(text) {
-                    if (!document.body) return false;
-                    return document.body.innerText.toLowerCase().includes(text.toLowerCase());
-                }
-
-                if (bodyHas("captcha incorrecto") ||
-                    bodyHas("código captcha incorrecto") ||
-                    bodyHas("codigo captcha incorrecto") ||
-                    bodyHas("ingrese el código") ||
-                    bodyHas("ingrese codigo") ||
-                    bodyHas("código captcha") ) {
-                    return "captcha_error";
-                }
-
-                let rows = Array.from(document.querySelectorAll("table tbody tr"));
-                if (!rows.length) {
-                    rows = Array.from(document.querySelectorAll("tbody tr"));
-                }
-
-                let dataRows = 0;
-                for (const r of rows) {
-                    const cells = r.querySelectorAll("td");
-                    if (cells.length >= 3) {
-                        const c0 = (cells[0].innerText || "").trim();
-                        const c1 = (cells[1].innerText || "").trim();
-                        if (c0 && c1) {
-                            dataRows++;
-                        }
-                    }
-                }
-
-                if (dataRows > 0) return "ok";
-                return "empty";
-            }
-            """
-        )
-
-        print(f"🔍 Estado detectado tras Buscar: {status}")
-        return status
-
-    async def solve_and_search_with_retries(self, page: Page) -> bool:
-        """
-        Reintenta resolver el CAPTCHA y hacer Buscar hasta que:
-          - Se detecten filas de convocatorias ("ok"), o
-          - Se agoten los max_captcha_attempts.
-        """
-        for attempt in range(1, self.max_captcha_attempts + 1):
-            if attempt > 1:
-                print("🔄 Re-cargando página para nuevo intento de CAPTCHA...")
-                await page.goto(self.url, timeout=self.timeout_ms)
-                await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
-                await self.handle_overlays(page)
-
-            await self.fill_captcha_and_click_search_once(page, attempt)
-            status = await self.check_search_result_status(page)
-
-            if status == "ok":
-                print("✅ Búsqueda con CAPTCHA exitosa, se encontró tabla con filas.")
-                return True
-            elif status == "captcha_error":
-                print("⚠️ Error de CAPTCHA detectado, se reintentará si hay intentos disponibles.")
-            else:
-                print("ℹ️ No se detectaron filas válidas; intento fallido.")
-
-        print("❌ No se logró pasar el CAPTCHA / obtener filas tras reintentos.")
-        return False
-
-    # -------------------------- Parsing fechas ------------------------------
-
-    def parse_cierre_postulacion(self, text: str) -> Optional[datetime]:
-        """
-        Intenta extraer una fecha/hora de cierre.
-        Devuelve datetime con tz America/Lima o None.
-        """
-        if not text:
-            return None
-
-        text = text.strip()
-        if not text:
-            return None
-
-        # 1) Formatos tipo DD/MM/YYYY o DD-MM-YYYY (con o sin hora)
-        m = re.search(
-            r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
-            text,
-        )
-        if m:
-            date_str = m.group(1)
-            formatos = [
-                "%d/%m/%Y %H:%M:%S",
-                "%d/%m/%Y %H:%M",
-                "%d/%m/%Y",
-                "%d-%m-%Y %H:%M:%S",
-                "%d-%m-%Y %H:%M",
-                "%d-%m-%Y",
-            ]
-            for fmt in formatos:
-                try:
-                    dt = datetime.strptime(date_str, fmt)
-                    return dt.replace(tzinfo=LIMA_TZ)
-                except ValueError:
-                    continue
-
-        # 2) Formatos tipo "02 Dec 25" o "02 December 2025"
-        m2 = re.search(
-            r"(\d{1,2}\s+[A-Za-z]{3,}\s+\d{2,4})",
-            text,
-        )
-        if m2:
-            date_str2 = m2.group(1)
-            formatos2 = [
-                "%d %b %Y",
-                "%d %b %y",
-                "%d %B %Y",
-                "%d %B %y",
-            ]
-            for fmt in formatos2:
-                try:
-                    dt = datetime.strptime(date_str2, fmt)
-                    return dt.replace(tzinfo=LIMA_TZ)
-                except ValueError:
-                    continue
-
-        return None
-
-    def normalize_and_sort_convocatorias(
-        self,
-        rows: List[Dict[str, Any]],
-        run_ts: datetime,
-    ) -> List[Dict[str, Any]]:
-        """
-        - Convierte cierre_postulacion -> cierre_postulacion_lima (ISO con tz).
-        - Ordena por fecha de cierre DESCENDENTE (la más lejana/reciente primero).
-        - Estandariza fecha_extraccion en hora Lima.
-        """
-        for item in rows:
-            raw_cierre = (item.get("cierre_postulacion") or "").strip()
-            dt = self.parse_cierre_postulacion(raw_cierre)
-
-            if dt is not None:
-                item["cierre_postulacion_lima"] = dt.isoformat()
-                item["_sort_cierre_dt"] = dt
-            else:
-                item["cierre_postulacion_lima"] = None
-                item["_sort_cierre_dt"] = None
-
-            item["fecha_extraccion"] = run_ts.isoformat()
-
-        # Para orden descendente: los None al final -> asignamos datetime.min
-        default_dt = datetime.min.replace(tzinfo=LIMA_TZ)
-        sorted_rows = sorted(
-            rows,
-            key=lambda x: x.get("_sort_cierre_dt") or default_dt,
-            reverse=True,  # DESCENDENTE
-        )
-
-        for item in sorted_rows:
-            item.pop("_sort_cierre_dt", None)
-
-        return sorted_rows
-
-    # -------------------------- Extracción DOM ------------------------------
-
-    async def extract_page(self, page: Page) -> List[Dict[str, Any]]:
-        """
-        Extrae filas de la página actual (sin descargar PDFs todavía).
-        Añade _row_index_in_page para luego poder localizar la fila real
-        y disparar la descarga desde Playwright.
-        """
-        print("📊 Extrayendo filas de la página actual...")
-        try:
-            await page.wait_for_selector("table, tbody tr", timeout=self.timeout_ms)
-        except Exception:
-            print("⚠️ No se encontraron tablas. Se devuelve lista vacía.")
-            return []
-
-        await self.handle_overlays(page)
-
-        data: List[Dict[str, Any]] = await page.evaluate(
-            """
-            () => {
-                const results = [];
-                function clean(t) {
-                    return t ? t.trim().replace(/\\s+/g, ' ') : '';
-                }
-
-                let rows = Array.from(document.querySelectorAll('table tbody tr'));
-                if (!rows.length) {
-                    rows = Array.from(document.querySelectorAll('tbody tr'));
-                }
-
-                rows.forEach((row, idx) => {
-                    const cells = row.querySelectorAll('td');
-                    if (cells.length < 4) return;
-
-                    const item = {
-                        numero_convocatoria: clean(cells[0]?.innerText || ''),
-                        unidad_organica:    clean(cells[1]?.innerText || ''),
-                        descripcion:        clean(cells[2]?.innerText || ''),
-                        cierre_postulacion: clean(cells[3]?.innerText || ''),
-                        _row_index_in_page: idx,
-                    };
-
-                    if (item.numero_convocatoria) {
-                        results.push(item);
-                    }
-                });
-
-                return results;
-            }
-            """
-        )
-
-        print(f"✅ Filas extraídas en esta página (sin TDR): {len(data)}")
-        return data
-
-    async def enrich_row_with_tdr_pdf(
-        self,
-        page: Page,
-        row_locator,
-        item: Dict[str, Any],
-    ) -> None:
-        """
-        Para una fila concreta:
-        - Intenta localizar el elemento clicable del TDR.
-        - Usa expect_download() para capturar el PDF.
-        - Extrae 'caracteristicas_tecnicas' del PDF.
-        """
-        try:
-            clickable = row_locator.locator("a, button, img, span")
-            n = await clickable.count()
-            if n == 0:
-                return
-
-            candidate = None
-
-            for j in range(n):
-                el = clickable.nth(j)
-                try:
-                    txt = (await el.inner_text()).strip().lower()
-                except Exception:
-                    txt = ""
-
-                alt = (await el.get_attribute("alt")) or ""
-                title = (await el.get_attribute("title")) or ""
-                src = (await el.get_attribute("src")) or ""
-                onclick = (await el.get_attribute("onclick")) or ""
-
-                combined = " ".join([txt, alt, title, onclick]).lower()
-
-                if "ver" in txt and "pdf" not in combined and "tdr" not in combined:
-                    # Probable botón de "Ver", no forzamos descarga aquí
-                    continue
-
-                if any(
-                    kw in combined
-                    for kw in [
-                        "tdr",
-                        "especificacion",
-                        "especificación",
-                        "caracteristica tecnica",
-                        "característica técnica",
-                    ]
-                ) or "pdf" in src.lower():
-                    candidate = el
-                    break
-
-            if candidate is None:
-                # No se encontró botón/ícono razonable para TDR
-                return
-
-            print(f"📥 Intentando descargar TDR para {item.get('numero_convocatoria')}...")
-            try:
-                async with page.expect_download(timeout=self.timeout_ms) as dl_info:
-                    await candidate.click()
-                download = await dl_info.value
-            except Exception as e:
-                print(f"⚠️ No se produjo descarga para la fila: {e}")
-                return
-
-            tmp_path = await download.path()
-            if not tmp_path:
-                print("⚠️ Descarga sin ruta de archivo (tmp_path vacío).")
-                return
-
-            suggested_name = download.suggested_filename or os.path.basename(tmp_path)
-            item["tdr_filename"] = suggested_name
-            item["tdr_downloaded"] = True
-
-            # Extraer bloque de CARACTERISTICAS TECNICAS
-            block = extract_caracteristicas_from_pdf(tmp_path)
-            if block:
-                item["caracteristicas_tecnicas"] = block
-            else:
-                item["caracteristicas_tecnicas"] = None
-
-        except Exception as e:
-            print(f"⚠️ Error enriqueciendo fila con TDR: {e}")
-
-    async def paginate_and_extract(self, page: Page) -> List[Dict[str, Any]]:
-        """
-        Recorre las páginas usando "Siguiente", acumulando filas.
-        Para cada fila intenta descargar y procesar el TDR.
-        """
-        all_rows: List[Dict[str, Any]] = []
-
-        for idx_page in range(self.max_pages):
-            print(f"📄 Página {idx_page + 1}/{self.max_pages}")
-            page_rows = await self.extract_page(page)
-
-            # Locator de filas reales en la página para mapear _row_index_in_page
-            rows_locator = page.locator("table tbody tr")
-            cnt = await rows_locator.count()
-            if cnt == 0:
-                rows_locator = page.locator("tbody tr")
-                cnt = await rows_locator.count()
-
-            for item in page_rows:
-                row_idx = item.get("_row_index_in_page")
-                if row_idx is None or row_idx >= cnt:
-                    continue
-
-                row_loc = rows_locator.nth(row_idx)
-                await self.enrich_row_with_tdr_pdf(page, row_loc, item)
-                item.pop("_row_index_in_page", None)
-                all_rows.append(item)
-
-            # Buscar botón "Siguiente"
-            next_selectors = [
-                'a[aria-label*="Siguiente"]',
-                'button[aria-label*="Siguiente"]',
-                'a:has-text("Siguiente")',
-                'button:has-text("Siguiente")',
-                'a:has-text("Sig.")',
-                'a[title*="Siguiente"]',
-            ]
-            next_btn = None
-            for sel in next_selectors:
-                try:
-                    cand = page.locator(sel).first
-                    if await cand.is_visible(timeout=2000):
-                        aria_dis = await cand.get_attribute("aria-disabled")
-                        disabled = await cand.get_attribute("disabled")
-                        if aria_dis in ("true", "1") or disabled is not None:
-                            continue
-                        next_btn = cand
-                        break
-                except Exception:
-                    continue
-
-            if not next_btn:
-                print("⏹️ No se encontró 'Siguiente' activo. Fin de paginación.")
-                break
-
-            print("➡️ Avanzando a la siguiente página...")
-            try:
-                await next_btn.click()
-            except Exception as e:
-                print(f"⚠️ Error haciendo clic en Siguiente: {e}")
-                break
-
-            try:
-                await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
-                await asyncio.sleep(1)
-            except Exception:
-                pass
-
-        print(f"📊 Total filas acumuladas (sin normalizar): {len(all_rows)}")
-        return all_rows
-
-    # -------------------------- Ejecución ----------------------------------
-
-    async def run(self) -> Dict[str, Any]:
-        print("🚀 Iniciando scraper PJ 8UIT...")
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=self.headless,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-            page = await browser.new_page()
-            await self.setup_page(page)
-
-            try:
-                print(f"🌐 Navegando a: {self.url}")
-                await page.goto(self.url, timeout=self.timeout_ms)
-                await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
-                await self.handle_overlays(page)
-
-                ok = await self.solve_and_search_with_retries(page)
-                if not ok:
-                    print("❌ No se logró obtener tabla con filas tras reintentos.")
-                    now_lima = datetime.now(LIMA_TZ)
-                    return {
-                        "success": False,
-                        "timestamp": now_lima.isoformat(),
-                        "source_url": self.url,
-                        "total_convocatorias": 0,
-                        "convocatorias": [],
-                        "error": "No se logró pasar CAPTCHA / obtener filas tras reintentos",
-                    }
-
-                rows_raw = await self.paginate_and_extract(page)
-                run_ts = datetime.now(LIMA_TZ)
-                rows = self.normalize_and_sort_convocatorias(rows_raw, run_ts)
-
-                result: Dict[str, Any] = {
-                    "success": True,
-                    "timestamp": run_ts.isoformat(),
-                    "source_url": self.url,
-                    "total_convocatorias": len(rows),
-                    "convocatorias": rows,
-                }
-                print(f"🎉 Scraping terminado. Total convocatorias: {len(rows)}")
-                return result
-
-            finally:
-                await browser.close()
-
-
-# ---------------------------------------------------------------------------
-# Wrappers para GitHub Actions y pruebas locales
-# ---------------------------------------------------------------------------
-
-async def run_github() -> int:
-    captcha_code = os.getenv("CAPTCHA_CODE") or os.getenv("PJ_CAPTCHA")
-    timeout_env = os.getenv("SCRAPER_TIMEOUT", "60")
-    try:
-        timeout_val = int(timeout_env)
-    except ValueError:
-        timeout_val = 60
-
-    scraper = PJScraper(
-        headless=True,
-        timeout=timeout_val,
-        captcha_code=captcha_code,
-        use_tesseract=True,
-        max_captcha_attempts=5,
-    )
-    result = await scraper.run()
-
-    os.makedirs("data/raw", exist_ok=True)
-    os.makedirs("data/processed", exist_ok=True)
-
-    ts = datetime.now(LIMA_TZ).strftime("%Y%m%d_%H%M%S")
-
-    raw_file = f"data/raw/pj_8uit_raw_{ts}.json"
-    with open(raw_file, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-
-    convocatorias = result.get("convocatorias", [])
-    total = result.get("total_convocatorias", len(convocatorias))
-
-    processed = {
-        "metadata": {
-            "source": "pj_8uit_convocatorias",
-            "extraction_timestamp": result.get(
-                "timestamp",
-                datetime.now(LIMA_TZ).isoformat()
-            ),
-            "total_records": total,
-        },
-        "convocatorias": convocatorias,
-    }
-    proc_file = f"data/processed/pj_8uit_tdr_{ts}.json"
-    with open(proc_file, "w", encoding="utf-8") as f:
-        json.dump(processed, f, indent=2, ensure_ascii=False)
-
-    print("📁 Archivos guardados:")
-    print(f"  RAW JSON:  {raw_file}")
-    print(f"  PROC JSON: {proc_file}")
-
-    return 0 if result.get("success") else 1
-
-
-async def run_local() -> None:
-    """Modo debug local (abre navegador visible)."""
-    scraper = PJScraper(
-        headless=False,
-        timeout=90,
-        captcha_code=None,
-        use_tesseract=True,
-        max_captcha_attempts=5,
-    )
-    result = await scraper.run()
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "github":
-        code = asyncio.run(run_github())
-        sys.exit(code)
-    else:
-        asyncio.run(run_local())
+::contentReference[oaicite:0]{index=0}
