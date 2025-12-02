@@ -1,12 +1,21 @@
 name: PJ 8UIT Scraper
 
 on:
-  # Lanzar manualmente desde la pestaña “Actions”
   workflow_dispatch:
+    inputs:
+      timeout:
+        description: 'Timeout en segundos para el scraper'
+        required: false
+        default: '60'
+        type: string
+
+env:
+  SCRAPER_TIMEOUT: ${{ github.event.inputs.timeout || '60' }}
+  # Opcional: si quieres forzar un código de CAPTCHA fijo de prueba
+  # CAPTCHA_CODE: 'ABCD'
 
 jobs:
-  scrape:
-    name: Extraer convocatorias <= 8 UIT (TDR)
+  scrape-8uit:
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
@@ -23,42 +32,47 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y tesseract-ocr tesseract-ocr-spa xvfb
+
           echo "Tesseract version:"
           tesseract --version
 
       - name: Install Python dependencies
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install \
+            playwright \
+            aiohttp \
+            pytesseract \
+            Pillow \
+            numpy \
+            opencv-python-headless \
+            requests \
+            PyPDF2
           playwright install chromium
 
-      - name: Create directories
+      - name: Create data directories
         run: |
           mkdir -p data/raw data/processed captcha_images
 
-      - name: Run PJ 8UIT scraper
+      - name: Run PJ 8UIT scraper (with Xvfb)
         env:
-          DISPLAY: :99
-          # OPCIONAL: si quieres probar con un captcha fijo, crea un secret
-          # llamado PJ_CAPTCHA_CODE y pon el código manualmente
-          CAPTCHA_CODE: ${{ secrets.PJ_CAPTCHA_CODE }}
-          SCRAPER_TIMEOUT: 60
+          # Si quieres usar secreto para el captcha fijo:
+          # CAPTCHA_CODE: ${{ secrets.PJ_CAPTCHA }}
+          SCRAPER_TIMEOUT: ${{ env.SCRAPER_TIMEOUT }}
         run: |
-          echo "Lanzando Xvfb..."
+          export DISPLAY=:99
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 3
 
-          echo "Ejecutando scraper..."
           python src/pj_scraper.py github
 
-      - name: Upload artifacts (JSON + captchas)
-        uses: actions/upload-artifact@v4
+      - name: Upload JSON results
         if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: pj-8uit-results
+          name: pj-8uit-scraper-${{ github.run_number }}
           path: |
-            data/
+            data/raw/
+            data/processed/
             captcha_images/
-            *.json
-            *.png
           retention-days: 30
