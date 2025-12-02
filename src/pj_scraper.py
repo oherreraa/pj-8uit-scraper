@@ -20,7 +20,8 @@ Objetivo:
         - Intentar localizar el elemento que descarga el TDR.
         - Usar page.expect_download() para capturar el PDF.
         - Extraer el bloque "CARACTERISTICAS TECNICAS" del PDF, con OCR si es imagen.
-        - Intentar interpretar ese bloque como tabla y devolver ambas cosas.
+        - Reorganizar esa información en un solo string con varios párrafos
+          (en orden de Ítem) y almacenarla en `caracteristicas_tecnicas`.
     * Guardar resultados en JSON (raw + procesado) para GitHub Actions.
 """
 
@@ -167,7 +168,7 @@ def extract_text_from_pdf_with_ocr(pdf_path: str) -> str:
 
     # Si el texto embebido parece razonable, lo usamos
     if len(text_py) > 500:  # umbral heurístico
-        print(f"📄 Texto PyPDF2 usado (len={len(text_py)}) para {pdf_path}")
+        print(f("📄 Texto PyPDF2 usado (len={len(text_py)}) para {pdf_path}"))
         return text_py
 
     print(f"ℹ️ Texto embebido insuficiente (len={len(text_py)}). Fallback a OCR: {pdf_path}")
@@ -293,21 +294,16 @@ def parse_caracteristicas_table(segment: str) -> Optional[List[Dict[str, str]]]:
     return rows or None
 
 
-def extract_caracteristicas_from_pdf(pdf_path: str) -> Tuple[Optional[str], Optional[List[Dict[str, str]]]]:
+def extract_caracteristicas_from_pdf(pdf_path: str) -> Optional[str]:
     """
-    Extrae del PDF:
-      - El bloque de texto correspondiente a 'CARACTERISTICAS TECNICAS'
-        (tolerando variantes con tilde).
-      - Una posible tabla estructurada a partir de ese bloque.
-
-    Retorna:
-      (segmento_texto, tabla_estructura)  donde:
-        - segmento_texto: str o None
-        - tabla_estructura: list[dict] o None
+    Extrae del PDF el bloque 'CARACTERISTICAS TECNICAS' y lo reorganiza
+    en un solo string con diferentes párrafos, ordenado por Ítem cuando
+    sea posible. Si no se puede interpretar la tabla, se devuelve el
+    segmento crudo recortado.
     """
     full_text = extract_text_from_pdf_with_ocr(pdf_path)
     if not full_text:
-        return None, None
+        return None
 
     normalized = full_text.upper()
 
@@ -329,7 +325,7 @@ def extract_caracteristicas_from_pdf(pdf_path: str) -> Tuple[Optional[str], Opti
 
     if start_idx == -1:
         print(f"ℹ️ No se encontró encabezado 'CARACTERISTICAS TECNICAS' en {pdf_path}")
-        return None, None
+        return None
 
     # Detectar fin de la sección por palabras clave típicas
     end_markers = [
@@ -353,14 +349,97 @@ def extract_caracteristicas_from_pdf(pdf_path: str) -> Tuple[Optional[str], Opti
             end_idx = min(end_idx, pos)
 
     segment = full_text[start_idx:end_idx].strip()
-    max_len = 8000  # límite razonable
-    if len(segment) > max_len:
-        segment = segment[:max_len] + "\n[...]"
 
-    # Intentar parsear tabla
+    # Intentar interpretarlo como tabla
     tabla = parse_caracteristicas_table(segment)
+    if tabla:
+        headers = list(tabla[0].keys())
 
-    return segment, tabla
+        def find_key(predicate) -> Optional[str]:
+            for k in headers:
+                if predicate(k.upper()):
+                    return k
+            return None
+
+        item_key = find_key(lambda u: "ITEM" in u or "ÍTEM" in u)
+        desc_key = find_key(lambda u: "DESCRIPC" in u)
+        und_key = find_key(lambda u: "UND" in u or "U.M" in u or "UNIDAD" in u)
+        cant_key = find_key(lambda u: "CANT" in u)
+        extra_keys = [
+            k for k in headers
+            if k not in {item_key, desc_key, und_key, cant_key} and k
+        ]
+
+        def sort_key(row: Dict[str, str]) -> int:
+            if not item_key:
+                return 0
+            val = (row.get(item_key) or "").strip()
+            m = re.search(r"\d+", val)
+            if not m:
+                return 0
+            try:
+                return int(m.group())
+            except Exception:
+                return 0
+
+        ordered_rows = sorted(tabla, key=sort_key)
+
+        paragraphs: List[str] = []
+        for row in ordered_rows:
+            item_val = (row.get(item_key) or "").strip() if item_key else ""
+            desc_val = (row.get(desc_key) or "").strip() if desc_key else ""
+            und_val = (row.get(und_key) or "").strip() if und_key else ""
+            cant_val = (row.get(cant_key) or "").strip() if cant_key else ""
+
+            # Título del párrafo
+            if item_val and desc_val:
+                title = f"Ítem {item_val}: {desc_val}"
+            elif desc_val:
+                title = desc_val
+            elif item_val:
+                title = f"Ítem {item_val}"
+            else:
+                title = ""
+
+            parts: List[str] = []
+            if title:
+                parts.append(title)
+
+            # Detalles secundarios
+            details: List[str] = []
+            if und_val:
+                details.append(f"Unidad: {und_val}")
+            if cant_val:
+                details.append(f"Cantidad: {cant_val}")
+
+            for ek in extra_keys:
+                v = (row.get(ek) or "").strip()
+                if v:
+                    details.append(f"{ek}: {v}")
+
+            if details:
+                parts.append(". ".join(details))
+
+            para = ". ".join(parts)
+            if para and not para.endswith("."):
+                para += "."
+
+            if para:
+                paragraphs.append(para)
+
+        header_text = "CARACTERÍSTICAS TÉCNICAS"
+        if paragraphs:
+            text = header_text + "\n\n" + "\n\n".join(paragraphs)
+        else:
+            text = segment
+    else:
+        text = segment
+
+    max_len = 8000  # límite razonable
+    if len(text) > max_len:
+        text = text[:max_len] + "\n[...]"
+
+    return text
 
 
 async def debug_dump_page(page: Page, label: str = "after_search") -> None:
@@ -869,9 +948,8 @@ class PJScraper:
         Para una fila concreta:
         - Intenta localizar el elemento clicable del TDR.
         - Usa expect_download() para capturar el PDF.
-        - Aplica extracción + OCR:
-            * 'caracteristicas_tecnicas' -> texto del bloque.
-            * 'caracteristicas_tecnicas_tabla' -> lista de dicts (tabla).
+        - Aplica extracción + OCR y guarda todo en:
+            * 'caracteristicas_tecnicas' -> texto ordenado en párrafos.
         """
         try:
             clickable = row_locator.locator("a, button, img, span")
@@ -934,10 +1012,9 @@ class PJScraper:
             item["tdr_filename"] = suggested_name
             item["tdr_downloaded"] = True
 
-            # Extraer bloque + tabla (texto+OCR)
-            block, tabla = extract_caracteristicas_from_pdf(tmp_path)
+            # Extraer bloque de características como texto ordenado
+            block = extract_caracteristicas_from_pdf(tmp_path)
             item["caracteristicas_tecnicas"] = block
-            item["caracteristicas_tecnicas_tabla"] = tabla
 
         except Exception as e:
             print(f"⚠️ Error enriqueciendo fila con TDR: {e}")
