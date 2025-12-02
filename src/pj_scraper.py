@@ -23,8 +23,8 @@ Objetivo:
         - descripcion
         - cierre_postulacion (texto original)
         - cierre_postulacion_lima (ISO 8601 con tz America/Lima)
-        - tdr_url  (link absoluto al PDF del TDR/E.T.)
-        - detalle_url (link absoluto al "Ver" detalle)
+        - tdr_url  (link absoluto al PDF del TDR/E.T. si es detectable)
+        - detalle_url (link absoluto al "Ver" detalle si es detectable)
 """
 
 import asyncio
@@ -522,33 +522,50 @@ class PJScraper:
         if not text:
             return None
 
-        # Buscar un patrón tipo DD/MM/YYYY, con o sin hora
+        # Buscar un patrón tipo DD/MM/YYYY o variantes
+        # El portal está usando cosas como "02 Dec 25" según tu ejemplo,
+        # así que agregamos un patrón para "DD Mon YY[YY]".
         m = re.search(
             r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
             text,
         )
-        if not m:
-            return None
+        if m:
+            date_str = m.group(1)
+            formatos = [
+                "%d/%m/%Y %H:%M:%S",
+                "%d/%m/%Y %H:%M",
+                "%d/%m/%Y",
+                "%d-%m-%Y %H:%M:%S",
+                "%d-%m-%Y %H:%M",
+                "%d-%m-%Y",
+            ]
+            for fmt in formatos:
+                try:
+                    dt = datetime.strptime(date_str, fmt)
+                    return dt.replace(tzinfo=LIMA_TZ)
+                except ValueError:
+                    continue
 
-        date_str = m.group(1)
-
-        # Intentar múltiples formatos
-        formatos = [
-            "%d/%m/%Y %H:%M:%S",
-            "%d/%m/%Y %H:%M",
-            "%d/%m/%Y",
-            "%d-%m-%Y %H:%M:%S",
-            "%d-%m-%Y %H:%M",
-            "%d-%m-%Y",
-        ]
-
-        for fmt in formatos:
-            try:
-                dt = datetime.strptime(date_str, fmt)
-                # Asumimos que la fecha está en hora local de Lima
-                return dt.replace(tzinfo=LIMA_TZ)
-            except ValueError:
-                continue
+        # Intento: formato "02 Dec 25" o "02 Dec 2025"
+        # Normalizamos abreviatura de mes en inglés.
+        m2 = re.search(
+            r"(\d{1,2}\s+[A-Za-z]{3,}\s+\d{2,4})",
+            text,
+        )
+        if m2:
+            date_str2 = m2.group(1)
+            formatos2 = [
+                "%d %b %Y",
+                "%d %b %y",
+                "%d %B %Y",
+                "%d %B %y",
+            ]
+            for fmt in formatos2:
+                try:
+                    dt = datetime.strptime(date_str2, fmt)
+                    return dt.replace(tzinfo=LIMA_TZ)
+                except ValueError:
+                    continue
 
         # Si nada funcionó
         return None
@@ -594,7 +611,7 @@ class PJScraper:
     # -------------------------- Extracción ---------------------------------
 
     async def extract_page(self, page: Page) -> List[Dict[str, Any]]:
-        """Extraer las filas de la tabla de la página actual."""
+        """Extraer las filas de la tabla de la página actual, con intento de reconstruir URLs de TDR/Detalle desde href/onclick."""
         print("📊 Extrayendo filas de la página actual...")
         try:
             await page.wait_for_selector("table, tbody tr", timeout=self.timeout_ms)
@@ -629,25 +646,84 @@ class PJScraper:
                         cierre_postulacion: clean(cells[3]?.innerText || ''),
                     };
 
-                    const links = row.querySelectorAll('a');
-                    links.forEach(a => {
-                        const txt = clean(a.textContent || '').toLowerCase();
-                        const hrefAttr = a.getAttribute('href') || '';
-                        if (!hrefAttr) return;
+                    // Buscar elementos clicables potenciales de TDR / Detalle
+                    const clickable = row.querySelectorAll('a, button, img, span');
 
-                        // Normalizar a URL absoluta usando window.location.origin
-                        let fullHref = hrefAttr;
-                        try {
-                            const urlObj = new URL(hrefAttr, window.location.origin);
-                            fullHref = urlObj.toString();
-                        } catch (e) {
-                            fullHref = hrefAttr;
+                    clickable.forEach(el => {
+                        const txt = clean(el.textContent || '').toLowerCase();
+                        const hrefAttr = el.getAttribute('href') || '';
+                        const onclickAttr = el.getAttribute('onclick') || '';
+
+                        // Normalizar href a URL absoluta si no es vacío/#
+                        let fullHref = '';
+                        if (hrefAttr && hrefAttr !== '#') {
+                            try {
+                                const urlObj = new URL(hrefAttr, window.location.origin);
+                                fullHref = urlObj.toString();
+                            } catch (e) {
+                                fullHref = hrefAttr;
+                            }
                         }
 
-                        if (fullHref.toLowerCase().includes('pdf')) {
-                            item.tdr_url = fullHref;
-                        } else if (txt.includes('ver')) {
-                            item.detalle_url = fullHref;
+                        // 1) Intentar detectar URL de PDF desde href o desde onclick
+                        let pdfUrl = null;
+
+                        // 1.a) href directo con .pdf
+                        if (fullHref && fullHref.toLowerCase().includes('.pdf')) {
+                            pdfUrl = fullHref;
+                        } else if (onclickAttr) {
+                            // 1.b) Buscar en onclick algo entre comillas que termine en .pdf...
+                            const m = onclickAttr.match(/['"]([^'"]*\\.pdf[^'"]*)['"]/i);
+                            if (m && m[1]) {
+                                try {
+                                    const urlObj = new URL(m[1], window.location.origin);
+                                    pdfUrl = urlObj.toString();
+                                } catch (e) {
+                                    pdfUrl = m[1];
+                                }
+                            }
+                        }
+
+                        if (pdfUrl && !item.tdr_url) {
+                            item.tdr_url = pdfUrl;
+                        }
+
+                        // 2) Intentar detalle:
+                        //    - texto "ver" o "detalle"
+                        //    - o onclick que llame a algo tipo verDetalle(...) con URL
+                        if (!item.detalle_url) {
+                            let detalle = null;
+
+                            if (txt.includes('ver') || txt.includes('detalle')) {
+                                if (fullHref && fullHref !== '#') {
+                                    detalle = fullHref;
+                                } else if (onclickAttr) {
+                                    const m2 = onclickAttr.match(/['"]([^'"]*http[^'"]*)['"]/i);
+                                    if (m2 && m2[1]) {
+                                        try {
+                                            const urlObj = new URL(m2[1], window.location.origin);
+                                            detalle = urlObj.toString();
+                                        } catch (e) {
+                                            detalle = m2[1];
+                                        }
+                                    }
+                                }
+                            } else if (onclickAttr && /detalle|verConvoc/i.test(onclickAttr)) {
+                                // Fallback: cualquier llamada JS que contenga "detalle"
+                                const m3 = onclickAttr.match(/['"]([^'"]*http[^'"]*)['"]/i);
+                                if (m3 && m3[1]) {
+                                    try {
+                                        const urlObj = new URL(m3[1], window.location.origin);
+                                        detalle = urlObj.toString();
+                                    } catch (e) {
+                                        detalle = m3[1];
+                                    }
+                                }
+                            }
+
+                            if (detalle) {
+                                item.detalle_url = detalle;
+                            }
                         }
                     });
 
