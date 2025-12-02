@@ -11,8 +11,7 @@ on:
 
 env:
   SCRAPER_TIMEOUT: ${{ github.event.inputs.timeout || '60' }}
-  # Opcional: si quieres usar un CAPTCHA fijo, crea el secreto PJ_CAPTCHA
-  # y se inyectará como variable de entorno CAPTCHA_CODE
+  # Opcional: si quieres un CAPTCHA fijo, define el secreto PJ_CAPTCHA
   CAPTCHA_CODE: ${{ secrets.PJ_CAPTCHA }}
 
 jobs:
@@ -55,11 +54,7 @@ jobs:
             PyPDF2
           playwright install chromium
 
-      - name: Create data directories
-        run: |
-          mkdir -p data/raw data/processed captcha_images
-
-      - name: Run PJ 8UIT scraper (GitHub mode, with Xvfb)
+      - name: Run PJ 8UIT scraper (JSON-only output)
         env:
           SCRAPER_TIMEOUT: ${{ env.SCRAPER_TIMEOUT }}
           CAPTCHA_CODE: ${{ env.CAPTCHA_CODE }}
@@ -68,15 +63,5 @@ jobs:
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 3
 
+          # ÚNICA SALIDA: JSON procesado a stdout
           python src/pj_scraper.py github
-
-      - name: Upload JSON results and debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pj-8uit-scraper-${{ github.run_number }}
-          path: |
-            data/raw/
-            data/processed/
-            captcha_images/
-          retention-days: 30
