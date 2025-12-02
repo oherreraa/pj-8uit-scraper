@@ -16,15 +16,19 @@ Objetivo:
 - Cuando se obtenga una tabla con filas válidas:
     * Extraer todas las filas de la página.
     * Recorrer páginas con "Siguiente".
+    * Para cada fila:
+        - Intentar localizar el elemento que descarga el TDR.
+        - Usar page.expect_download() para capturar el PDF.
+        - Extraer el bloque "CARACTERISTICAS TECNICAS" del PDF.
     * Guardar resultados en JSON (raw + procesado) para GitHub Actions.
-    * Incluir en cada fila:
+    * En cada fila dejar:
         - numero_convocatoria
         - unidad_organica
         - descripcion
         - cierre_postulacion (texto original)
         - cierre_postulacion_lima (ISO 8601 con tz America/Lima)
-        - tdr_url  (link absoluto al PDF del TDR/E.T. si es detectable)
-        - detalle_url (link absoluto al "Ver" detalle si es detectable)
+        - tdr_filename (nombre del PDF descargado, si se logró)
+        - caracteristicas_tecnicas (bloque extraído del PDF, si se logró)
 """
 
 import asyncio
@@ -41,6 +45,7 @@ from playwright.async_api import async_playwright, Page
 
 from PIL import Image, ImageOps, ImageFilter
 import pytesseract
+from PyPDF2 import PdfReader
 
 
 URL = "https://sap.pj.gob.pe/portalabastecimiento-web/Convocatorias8uit"
@@ -48,22 +53,21 @@ LIMA_TZ = ZoneInfo("America/Lima")
 
 
 # ---------------------------------------------------------------------------
-# Utilidades de OCR / debug
+# Utilidades OCR / PDF / debug
 # ---------------------------------------------------------------------------
 
 def _clean_text(text: str) -> str:
-    """Limpia el texto devuelto por Tesseract."""
+    """Limpia texto devuelto por Tesseract (solo alfanumérico y mayúsculas)."""
     return "".join(c for c in text if c.isalnum()).upper()
 
 
 def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
     """
     Versión avanzada de OCR:
-    - Diversos preprocesados.
+    - Varios preprocesados.
     - Varias configuraciones Tesseract.
-    - Elige la mejor cadena según heurística simple.
+    - Devuelve el mejor candidato (4–6 caracteres preferido).
     """
-
     configs = [
         (
             "psm8_whitelist",
@@ -128,7 +132,6 @@ def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
             break
 
     if not best:
-        # Si no hay nada de longitud adecuada, elegimos la no vacía más larga
         candidates = [
             txt for _, txt in attempts if txt and not txt.startswith("ERROR:")
         ]
@@ -143,11 +146,87 @@ def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
     return None
 
 
+def extract_caracteristicas_from_pdf(pdf_path: str) -> Optional[str]:
+    """
+    Extrae el bloque de texto correspondiente a "CARACTERISTICAS TECNICAS"
+    (tolerando variantes con tilde) desde el PDF.
+
+    Retorna un string con ese bloque, recortado a un tamaño razonable.
+    """
+    try:
+        reader = PdfReader(pdf_path)
+    except Exception as e:
+        print(f"⚠️ No se pudo abrir PDF '{pdf_path}': {e}")
+        return None
+
+    texts: List[str] = []
+    for i, page in enumerate(reader.pages):
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        if t.strip():
+            texts.append(t)
+
+    if not texts:
+        print(f"⚠️ PDF sin texto legible: {pdf_path}")
+        return None
+
+    full_text = "\n".join(texts)
+    normalized = full_text.upper()
+
+    patterns = [
+        "CARACTERISTICAS TECNICAS",
+        "CARACTERÍSTICAS TÉCNICAS",
+        "CARACTERISTICAS TÉCNICAS",
+        "CARACTERÍSTICAS TECNICAS",
+    ]
+
+    start_idx = -1
+    chosen = ""
+    for p in patterns:
+        pos = normalized.find(p)
+        if pos != -1:
+            start_idx = pos
+            chosen = p
+            break
+
+    if start_idx == -1:
+        print(f"ℹ️ No se encontró encabezado 'CARACTERISTICAS TECNICAS' en {pdf_path}")
+        return None
+
+    # Buscar posible sección siguiente que marque el fin del bloque
+    end_markers = [
+        "CONDICIONES GENERALES",
+        "CONDICIONES CONTRACTUALES",
+        "CONDICIONES",
+        "REQUISITOS",
+        "OBLIGACIONES",
+        "PLAZO DE ENTREGA",
+        "PLAZO DE EJECUCION",
+        "PLAZO DE EJECUCIÓN",
+        "GARANTIAS",
+        "GARANTÍAS",
+        "FORMA DE PAGO",
+    ]
+
+    end_idx = len(full_text)
+    for m in end_markers:
+        pos = normalized.find(m, start_idx + len(chosen))
+        if pos != -1 and pos > start_idx:
+            end_idx = min(end_idx, pos)
+
+    segment = full_text[start_idx:end_idx].strip()
+    # Limitar el tamaño para que no sea gigantesco
+    max_len = 4000
+    if len(segment) > max_len:
+        segment = segment[:max_len] + "\n[...]"
+
+    return segment
+
+
 async def debug_dump_page(page: Page, label: str = "after_search") -> None:
-    """
-    Guardar screenshot + HTML de la página para debug.
-    Útil para ver qué mensaje devuelve el portal cuando falla el CAPTCHA.
-    """
+    """Guardado de screenshot + HTML de la página para debug."""
     try:
         os.makedirs("data/raw", exist_ok=True)
         ts = datetime.now(LIMA_TZ).strftime("%Y%m%d_%H%M%S")
@@ -215,7 +294,7 @@ class PJScraper:
         )
 
     async def handle_overlays(self, page: Page) -> None:
-        """Cerrar modales y aceptar cookies si aparecen."""
+        """Cerrar modales / banners de cookies si aparecen."""
         try:
             modal_selectors = [
                 ".modal:visible",
@@ -320,21 +399,16 @@ class PJScraper:
         else:
             captcha_text: Optional[str] = None
 
-            # 1) Código fijo vía entorno / secrets
             if self.captcha_code:
                 captcha_text = self.captcha_code.strip()
                 print(f"🔑 Usando CAPTCHA fijo: '{captcha_text}'")
-            # 2) OCR avanzado con Tesseract
             elif self.use_tesseract:
                 img = await self.capture_captcha_image(page)
                 if img is not None:
                     captcha_text = solve_captcha_tesseract_advanced(img)
 
             if not captcha_text:
-                print(
-                    "⚠️ No se obtuvo texto de CAPTCHA. "
-                    "Es probable que la búsqueda falle."
-                )
+                print("⚠️ No se obtuvo texto de CAPTCHA. La búsqueda probablemente falle.")
 
             input_loc = None
             input_selectors = [
@@ -360,7 +434,7 @@ class PJScraper:
             elif input_loc is None:
                 print("⚠️ No se encontró input de CAPTCHA.")
 
-        # Botón Buscar (primer intento con Playwright)
+        # Botón Buscar
         search_selectors = [
             'button:has-text("Buscar")',
             'input[value*="Buscar"]',
@@ -380,7 +454,6 @@ class PJScraper:
             except Exception:
                 continue
 
-        # Fallback: clic por DOM con evaluate en cualquier botón/input con texto "Buscar"
         if not clicked:
             print("⚠️ Locator no pudo hacer clic; intentando DOM click via evaluate...")
             try:
@@ -414,24 +487,20 @@ class PJScraper:
             await debug_dump_page(page, label=f"no_search_button_attempt_{attempt}")
             return
 
-        # Esperar a que se procese la búsqueda
         try:
             await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
         except Exception:
             pass
 
-        # Pequeña espera adicional para que cargue la tabla vía JS/XHR
         await asyncio.sleep(3)
-
-        # Dump de la página tras este intento (para análisis)
         await debug_dump_page(page, label=f"after_search_attempt_{attempt}")
 
     async def check_search_result_status(self, page: Page) -> str:
         """
-        Analiza el DOM después de Buscar y clasifica el estado:
-          - "ok": hay tabla con filas de convocatorias
-          - "captcha_error": mensaje típico de error de captcha
-          - "empty": sin filas válidas (tabla vacía u otro mensaje)
+        Clasifica el estado tras Buscar:
+          - "ok": hay tabla con filas
+          - "captcha_error": mensaje de error de captcha
+          - "empty": sin filas válidas
         """
         status = await page.evaluate(
             """
@@ -441,7 +510,6 @@ class PJScraper:
                     return document.body.innerText.toLowerCase().includes(text.toLowerCase());
                 }
 
-                // Mensajes típicos de error de captcha
                 if (bodyHas("captcha incorrecto") ||
                     bodyHas("código captcha incorrecto") ||
                     bodyHas("codigo captcha incorrecto") ||
@@ -451,7 +519,6 @@ class PJScraper:
                     return "captcha_error";
                 }
 
-                // Contar filas con datos en alguna tabla
                 let rows = Array.from(document.querySelectorAll("table tbody tr"));
                 if (!rows.length) {
                     rows = Array.from(document.querySelectorAll("tbody tr"));
@@ -483,7 +550,6 @@ class PJScraper:
         Reintenta resolver el CAPTCHA y hacer Buscar hasta que:
           - Se detecten filas de convocatorias ("ok"), o
           - Se agoten los max_captcha_attempts.
-        En cada intento se recarga la página para forzar nuevo CAPTCHA.
         """
         for attempt in range(1, self.max_captcha_attempts + 1):
             if attempt > 1:
@@ -493,7 +559,6 @@ class PJScraper:
                 await self.handle_overlays(page)
 
             await self.fill_captcha_and_click_search_once(page, attempt)
-
             status = await self.check_search_result_status(page)
 
             if status == "ok":
@@ -502,18 +567,17 @@ class PJScraper:
             elif status == "captcha_error":
                 print("⚠️ Error de CAPTCHA detectado, se reintentará si hay intentos disponibles.")
             else:
-                # "empty": puede ser tabla vacía o mensaje extraño
-                print("ℹ️ No se detectaron filas válidas; se considera intento fallido.")
+                print("ℹ️ No se detectaron filas válidas; intento fallido.")
 
-        print("❌ No se logró pasar el CAPTCHA / obtener filas tras varios intentos.")
+        print("❌ No se logró pasar el CAPTCHA / obtener filas tras reintentos.")
         return False
 
     # -------------------------- Parsing fechas ------------------------------
 
     def parse_cierre_postulacion(self, text: str) -> Optional[datetime]:
         """
-        Intenta extraer una fecha/hora de cierre desde el texto recibido.
-        Devuelve un datetime con tz America/Lima o None si no se puede parsear.
+        Intenta extraer una fecha/hora de cierre.
+        Devuelve datetime con tz America/Lima o None.
         """
         if not text:
             return None
@@ -522,9 +586,7 @@ class PJScraper:
         if not text:
             return None
 
-        # Buscar un patrón tipo DD/MM/YYYY o variantes
-        # El portal está usando cosas como "02 Dec 25" según tu ejemplo,
-        # así que agregamos un patrón para "DD Mon YY[YY]".
+        # 1) Formatos tipo DD/MM/YYYY o DD-MM-YYYY (con o sin hora)
         m = re.search(
             r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
             text,
@@ -546,8 +608,7 @@ class PJScraper:
                 except ValueError:
                     continue
 
-        # Intento: formato "02 Dec 25" o "02 Dec 2025"
-        # Normalizamos abreviatura de mes en inglés.
+        # 2) Formatos tipo "02 Dec 25" o "02 December 2025"
         m2 = re.search(
             r"(\d{1,2}\s+[A-Za-z]{3,}\s+\d{2,4})",
             text,
@@ -567,7 +628,6 @@ class PJScraper:
                 except ValueError:
                     continue
 
-        # Si nada funcionó
         return None
 
     def normalize_and_sort_convocatorias(
@@ -577,8 +637,8 @@ class PJScraper:
     ) -> List[Dict[str, Any]]:
         """
         - Convierte cierre_postulacion -> cierre_postulacion_lima (ISO con tz).
-        - Usa ese datetime para ordenar de la fecha más próxima a la más lejana.
-        - Estandariza fecha_extraccion en zona Lima para todas las filas.
+        - Ordena por fecha de cierre DESCENDENTE (la más lejana/reciente primero).
+        - Estandariza fecha_extraccion en hora Lima.
         """
         for item in rows:
             raw_cierre = (item.get("cierre_postulacion") or "").strip()
@@ -591,27 +651,29 @@ class PJScraper:
                 item["cierre_postulacion_lima"] = None
                 item["_sort_cierre_dt"] = None
 
-            # Estandarizar fecha_extraccion en hora Lima (la hora del scraping)
             item["fecha_extraccion"] = run_ts.isoformat()
 
-        # Ordenar por fecha de cierre de postulación (más próxima primero)
-        # Los que no tienen fecha parseable se van al final.
-        default_dt = datetime.max.replace(tzinfo=LIMA_TZ)
+        # Para orden descendente: los None al final -> asignamos datetime.min
+        default_dt = datetime.min.replace(tzinfo=LIMA_TZ)
         sorted_rows = sorted(
             rows,
             key=lambda x: x.get("_sort_cierre_dt") or default_dt,
+            reverse=True,  # DESCENDENTE
         )
 
-        # Limpiar campo interno de sort
         for item in sorted_rows:
             item.pop("_sort_cierre_dt", None)
 
         return sorted_rows
 
-    # -------------------------- Extracción ---------------------------------
+    # -------------------------- Extracción DOM ------------------------------
 
     async def extract_page(self, page: Page) -> List[Dict[str, Any]]:
-        """Extraer las filas de la tabla de la página actual, con intento de reconstruir URLs de TDR/Detalle desde href/onclick."""
+        """
+        Extrae filas de la página actual (sin descargar PDFs todavía).
+        Añade _row_index_in_page para luego poder localizar la fila real
+        y disparar la descarga desde Playwright.
+        """
         print("📊 Extrayendo filas de la página actual...")
         try:
             await page.wait_for_selector("table, tbody tr", timeout=self.timeout_ms)
@@ -629,13 +691,12 @@ class PJScraper:
                     return t ? t.trim().replace(/\\s+/g, ' ') : '';
                 }
 
-                // Intento amplio de selección de filas
                 let rows = Array.from(document.querySelectorAll('table tbody tr'));
                 if (!rows.length) {
                     rows = Array.from(document.querySelectorAll('tbody tr'));
                 }
 
-                rows.forEach(row => {
+                rows.forEach((row, idx) => {
                     const cells = row.querySelectorAll('td');
                     if (cells.length < 4) return;
 
@@ -644,88 +705,8 @@ class PJScraper:
                         unidad_organica:    clean(cells[1]?.innerText || ''),
                         descripcion:        clean(cells[2]?.innerText || ''),
                         cierre_postulacion: clean(cells[3]?.innerText || ''),
+                        _row_index_in_page: idx,
                     };
-
-                    // Buscar elementos clicables potenciales de TDR / Detalle
-                    const clickable = row.querySelectorAll('a, button, img, span');
-
-                    clickable.forEach(el => {
-                        const txt = clean(el.textContent || '').toLowerCase();
-                        const hrefAttr = el.getAttribute('href') || '';
-                        const onclickAttr = el.getAttribute('onclick') || '';
-
-                        // Normalizar href a URL absoluta si no es vacío/#
-                        let fullHref = '';
-                        if (hrefAttr && hrefAttr !== '#') {
-                            try {
-                                const urlObj = new URL(hrefAttr, window.location.origin);
-                                fullHref = urlObj.toString();
-                            } catch (e) {
-                                fullHref = hrefAttr;
-                            }
-                        }
-
-                        // 1) Intentar detectar URL de PDF desde href o desde onclick
-                        let pdfUrl = null;
-
-                        // 1.a) href directo con .pdf
-                        if (fullHref && fullHref.toLowerCase().includes('.pdf')) {
-                            pdfUrl = fullHref;
-                        } else if (onclickAttr) {
-                            // 1.b) Buscar en onclick algo entre comillas que termine en .pdf...
-                            const m = onclickAttr.match(/['"]([^'"]*\\.pdf[^'"]*)['"]/i);
-                            if (m && m[1]) {
-                                try {
-                                    const urlObj = new URL(m[1], window.location.origin);
-                                    pdfUrl = urlObj.toString();
-                                } catch (e) {
-                                    pdfUrl = m[1];
-                                }
-                            }
-                        }
-
-                        if (pdfUrl && !item.tdr_url) {
-                            item.tdr_url = pdfUrl;
-                        }
-
-                        // 2) Intentar detalle:
-                        //    - texto "ver" o "detalle"
-                        //    - o onclick que llame a algo tipo verDetalle(...) con URL
-                        if (!item.detalle_url) {
-                            let detalle = null;
-
-                            if (txt.includes('ver') || txt.includes('detalle')) {
-                                if (fullHref && fullHref !== '#') {
-                                    detalle = fullHref;
-                                } else if (onclickAttr) {
-                                    const m2 = onclickAttr.match(/['"]([^'"]*http[^'"]*)['"]/i);
-                                    if (m2 && m2[1]) {
-                                        try {
-                                            const urlObj = new URL(m2[1], window.location.origin);
-                                            detalle = urlObj.toString();
-                                        } catch (e) {
-                                            detalle = m2[1];
-                                        }
-                                    }
-                                }
-                            } else if (onclickAttr && /detalle|verConvoc/i.test(onclickAttr)) {
-                                // Fallback: cualquier llamada JS que contenga "detalle"
-                                const m3 = onclickAttr.match(/['"]([^'"]*http[^'"]*)['"]/i);
-                                if (m3 && m3[1]) {
-                                    try {
-                                        const urlObj = new URL(m3[1], window.location.origin);
-                                        detalle = urlObj.toString();
-                                    } catch (e) {
-                                        detalle = m3[1];
-                                    }
-                                }
-                            }
-
-                            if (detalle) {
-                                item.detalle_url = detalle;
-                            }
-                        }
-                    });
 
                     if (item.numero_convocatoria) {
                         results.push(item);
@@ -737,18 +718,121 @@ class PJScraper:
             """
         )
 
-        print(f"✅ Filas extraídas en esta página: {len(data)}")
+        print(f"✅ Filas extraídas en esta página (sin TDR): {len(data)}")
         return data
 
+    async def enrich_row_with_tdr_pdf(
+        self,
+        page: Page,
+        row_locator,
+        item: Dict[str, Any],
+    ) -> None:
+        """
+        Para una fila concreta:
+        - Intenta localizar el elemento clicable del TDR.
+        - Usa expect_download() para capturar el PDF.
+        - Extrae 'caracteristicas_tecnicas' del PDF.
+        """
+        try:
+            clickable = row_locator.locator("a, button, img, span")
+            n = await clickable.count()
+            if n == 0:
+                return
+
+            candidate = None
+
+            for j in range(n):
+                el = clickable.nth(j)
+                try:
+                    txt = (await el.inner_text()).strip().lower()
+                except Exception:
+                    txt = ""
+
+                alt = (await el.get_attribute("alt")) or ""
+                title = (await el.get_attribute("title")) or ""
+                src = (await el.get_attribute("src")) or ""
+                onclick = (await el.get_attribute("onclick")) or ""
+
+                combined = " ".join([txt, alt, title, onclick]).lower()
+
+                if "ver" in txt and "pdf" not in combined and "tdr" not in combined:
+                    # Probable botón de "Ver", no forzamos descarga aquí
+                    continue
+
+                if any(
+                    kw in combined
+                    for kw in [
+                        "tdr",
+                        "especificacion",
+                        "especificación",
+                        "caracteristica tecnica",
+                        "característica técnica",
+                    ]
+                ) or "pdf" in src.lower():
+                    candidate = el
+                    break
+
+            if candidate is None:
+                # No se encontró botón/ícono razonable para TDR
+                return
+
+            print(f"📥 Intentando descargar TDR para {item.get('numero_convocatoria')}...")
+            try:
+                async with page.expect_download(timeout=self.timeout_ms) as dl_info:
+                    await candidate.click()
+                download = await dl_info.value
+            except Exception as e:
+                print(f"⚠️ No se produjo descarga para la fila: {e}")
+                return
+
+            tmp_path = await download.path()
+            if not tmp_path:
+                print("⚠️ Descarga sin ruta de archivo (tmp_path vacío).")
+                return
+
+            suggested_name = download.suggested_filename or os.path.basename(tmp_path)
+            item["tdr_filename"] = suggested_name
+            item["tdr_downloaded"] = True
+
+            # Extraer bloque de CARACTERISTICAS TECNICAS
+            block = extract_caracteristicas_from_pdf(tmp_path)
+            if block:
+                item["caracteristicas_tecnicas"] = block
+            else:
+                item["caracteristicas_tecnicas"] = None
+
+        except Exception as e:
+            print(f"⚠️ Error enriqueciendo fila con TDR: {e}")
+
     async def paginate_and_extract(self, page: Page) -> List[Dict[str, Any]]:
-        """Recorrer páginas usando 'Siguiente' y acumular filas."""
+        """
+        Recorre las páginas usando "Siguiente", acumulando filas.
+        Para cada fila intenta descargar y procesar el TDR.
+        """
         all_rows: List[Dict[str, Any]] = []
 
-        for idx in range(self.max_pages):
-            print(f"📄 Página {idx + 1}/{self.max_pages}")
-            rows = await self.extract_page(page)
-            all_rows.extend(rows)
+        for idx_page in range(self.max_pages):
+            print(f"📄 Página {idx_page + 1}/{self.max_pages}")
+            page_rows = await self.extract_page(page)
 
+            # Locator de filas reales en la página para mapear _row_index_in_page
+            rows_locator = page.locator("table tbody tr")
+            cnt = await rows_locator.count()
+            if cnt == 0:
+                rows_locator = page.locator("tbody tr")
+                cnt = await rows_locator.count()
+
+            for item in page_rows:
+                row_idx = item.get("_row_index_in_page")
+                if row_idx is None or row_idx >= cnt:
+                    continue
+
+                row_loc = rows_locator.nth(row_idx)
+                await self.enrich_row_with_tdr_pdf(page, row_loc, item)
+                item.pop("_row_index_in_page", None)
+                all_rows.append(item)
+
+            # Buscar botón "Siguiente"
             next_selectors = [
                 'a[aria-label*="Siguiente"]',
                 'button[aria-label*="Siguiente"]',
@@ -813,7 +897,6 @@ class PJScraper:
                 await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
                 await self.handle_overlays(page)
 
-                # Resolver captcha + Buscar con reintentos
                 ok = await self.solve_and_search_with_retries(page)
                 if not ok:
                     print("❌ No se logró obtener tabla con filas tras reintentos.")
@@ -827,10 +910,7 @@ class PJScraper:
                         "error": "No se logró pasar CAPTCHA / obtener filas tras reintentos",
                     }
 
-                # Extraer y paginar
                 rows_raw = await self.paginate_and_extract(page)
-
-                # Normalizar fechas y ordenar
                 run_ts = datetime.now(LIMA_TZ)
                 rows = self.normalize_and_sort_convocatorias(rows_raw, run_ts)
 
@@ -908,7 +988,7 @@ async def run_local() -> None:
     scraper = PJScraper(
         headless=False,
         timeout=90,
-        captcha_code=None,  # o un código fijo para probar
+        captcha_code=None,
         use_tesseract=True,
         max_captcha_attempts=5,
     )
