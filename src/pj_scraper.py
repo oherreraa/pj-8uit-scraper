@@ -19,16 +19,9 @@ Objetivo:
     * Para cada fila:
         - Intentar localizar el elemento que descarga el TDR.
         - Usar page.expect_download() para capturar el PDF.
-        - Extraer el bloque "CARACTERISTICAS TECNICAS" del PDF.
+        - Extraer el bloque "CARACTERISTICAS TECNICAS" del PDF, con OCR si es imagen.
+        - Intentar interpretar ese bloque como tabla y devolver ambas cosas.
     * Guardar resultados en JSON (raw + procesado) para GitHub Actions.
-    * En cada fila dejar:
-        - numero_convocatoria
-        - unidad_organica
-        - descripcion
-        - cierre_postulacion (texto original)
-        - cierre_postulacion_lima (ISO 8601 con tz America/Lima)
-        - tdr_filename (nombre del PDF descargado, si se logró)
-        - caracteristicas_tecnicas (bloque extraído del PDF, si se logró)
 """
 
 import asyncio
@@ -37,12 +30,14 @@ import os
 import sys
 import io
 import re
+import subprocess
+import glob
+import tempfile
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from zoneinfo import ZoneInfo
 from playwright.async_api import async_playwright, Page
-
 from PIL import Image, ImageOps, ImageFilter
 import pytesseract
 from PyPDF2 import PdfReader
@@ -63,12 +58,12 @@ def _clean_text(text: str) -> str:
 
 def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
     """
-    Versión avanzada de OCR:
+    Versión avanzada de OCR para CAPTCHA:
     - Varios preprocesados.
     - Varias configuraciones Tesseract.
     - Devuelve el mejor candidato (4–6 caracteres preferido).
     """
-    configs = [
+    configs: List[Tuple[str, str]] = [
         (
             "psm8_whitelist",
             "--oem 3 --psm 8 -l eng "
@@ -87,7 +82,7 @@ def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
         ("psm8_no_whitelist", "--oem 3 --psm 8 -l eng"),
     ]
 
-    variants: List[tuple[str, Image.Image]] = []
+    variants: List[Tuple[str, Image.Image]] = []
 
     base_gray = image.convert("L")
     variants.append(("gray", base_gray))
@@ -105,7 +100,7 @@ def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
         inv = inv.filter(ImageFilter.MedianFilter(size=3))
         variants.append((f"invert_med_x{scale}", inv))
 
-    attempts: List[tuple[str, str]] = []
+    attempts: List[Tuple[str, str]] = []
 
     for v_name, img_v in variants:
         for cfg_name, cfg in configs:
@@ -117,7 +112,7 @@ def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
             except Exception as e:
                 attempts.append((desc, f"ERROR:{e}"))
 
-    print("📜 Intentos de OCR:")
+    print("📜 Intentos de OCR (CAPTCHA):")
     for desc, txt in attempts:
         if txt.startswith("ERROR:"):
             print(f"  [{desc}] -> {txt}")
@@ -139,40 +134,181 @@ def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
             best = max(candidates, key=len)
 
     if best:
-        print(f"✅ Mejor resultado OCR: '{best}'")
+        print(f"✅ Mejor resultado OCR CAPTCHA: '{best}'")
         return best
 
-    print("❌ No se obtuvo un resultado OCR usable.")
+    print("❌ No se obtuvo un resultado OCR usable para CAPTCHA.")
     return None
 
 
-def extract_caracteristicas_from_pdf(pdf_path: str) -> Optional[str]:
+def extract_text_from_pdf_with_ocr(pdf_path: str) -> str:
     """
-    Extrae el bloque de texto correspondiente a "CARACTERISTICAS TECNICAS"
-    (tolerando variantes con tilde) desde el PDF.
+    Intenta extraer texto de un PDF.
+    1) Primero usa PyPDF2 (texto embebido).
+    2) Si el resultado es muy pobre (típico de PDFs escaneados),
+       hace fallback a OCR:
+       - Convierte el PDF a imágenes PNG con 'pdftoppm' (poppler-utils).
+       - Aplica Tesseract sobre cada página (lang='spa+eng').
+    Devuelve un string con todo el texto concatenado.
+    """
+    text_parts: List[str] = []
 
-    Retorna un string con ese bloque, recortado a un tamaño razonable.
-    """
+    # --- Paso 1: PyPDF2 (texto embebido) ---
     try:
         reader = PdfReader(pdf_path)
-    except Exception as e:
-        print(f"⚠️ No se pudo abrir PDF '{pdf_path}': {e}")
-        return None
-
-    texts: List[str] = []
-    for i, page in enumerate(reader.pages):
-        try:
+        for page in reader.pages:
             t = page.extract_text() or ""
-        except Exception:
-            t = ""
-        if t.strip():
-            texts.append(t)
+            if t.strip():
+                text_parts.append(t)
+    except Exception as e:
+        print(f"⚠️ Error leyendo PDF con PyPDF2 '{pdf_path}': {e}")
 
-    if not texts:
-        print(f"⚠️ PDF sin texto legible: {pdf_path}")
+    text_py = "\n".join(text_parts).strip()
+
+    # Si el texto embebido parece razonable, lo usamos
+    if len(text_py) > 500:  # umbral heurístico
+        print(f"📄 Texto PyPDF2 usado (len={len(text_py)}) para {pdf_path}")
+        return text_py
+
+    print(f"ℹ️ Texto embebido insuficiente (len={len(text_py)}). Fallback a OCR: {pdf_path}")
+
+    # --- Paso 2: OCR sobre imágenes ---
+    ocr_text_parts: List[str] = []
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_prefix = os.path.join(tmpdir, "page")
+            # Genera page-1.png, page-2.png, etc.
+            cmd = ["pdftoppm", "-png", pdf_path, out_prefix]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            png_files = sorted(glob.glob(os.path.join(tmpdir, "page-*.png")))
+            if not png_files:
+                print(f"⚠️ pdftoppm no generó imágenes para {pdf_path}")
+            else:
+                print(f"🖼️ OCR sobre {len(png_files)} páginas para {pdf_path}")
+
+            for png_path in png_files:
+                try:
+                    img = Image.open(png_path)
+                    # ligero preprocesado (gris + filtro mediana)
+                    img = img.convert("L")
+                    img = img.filter(ImageFilter.MedianFilter(size=3))
+                    # OCR en español+inglés
+                    txt = pytesseract.image_to_string(img, lang="spa+eng")
+                    if txt.strip():
+                        ocr_text_parts.append(txt)
+                except Exception as e:
+                    print(f"⚠️ Error OCR en {png_path}: {e}")
+
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️ Error ejecutando pdftoppm para {pdf_path}: {e}")
+    except Exception as e:
+        print(f"⚠️ Error general en OCR para {pdf_path}: {e}")
+
+    text_ocr = "\n".join(ocr_text_parts).strip()
+
+    # Prioridad: si OCR dio algo, lo usamos; si no, devolvemos lo poco que hubo de PyPDF2
+    if text_ocr:
+        print(f"📄 Texto OCR usado (len={len(text_ocr)}) para {pdf_path}")
+        return text_ocr
+
+    print(f"⚠️ No se obtuvo texto útil ni con PyPDF2 ni con OCR para {pdf_path}")
+    return text_py
+
+
+def parse_caracteristicas_table(segment: str) -> Optional[List[Dict[str, str]]]:
+    """
+    Intenta interpretar el bloque de 'CARACTERISTICAS TECNICAS' como una tabla.
+    Heurística:
+      - Busca una línea de encabezado con palabras tipo ITEM / DESCRIPCIÓN / UND / CANTIDAD.
+      - Usa separadores por "dos o más espacios" para dividir columnas.
+      - Cada línea siguiente se mapea a columnas.
+
+    Devuelve una lista de dicts {columna: valor} o None si no logra interpretar.
+    """
+    lines = [ln.strip() for ln in segment.splitlines()]
+    lines = [ln for ln in lines if ln]  # quitar vacías
+
+    if not lines:
         return None
 
-    full_text = "\n".join(texts)
+    header_idx = -1
+    header_cols: List[str] = []
+
+    # Buscamos encabezado
+    for i, ln in enumerate(lines):
+        upper = ln.upper()
+        if ("ITEM" in upper or "ÍTEM" in upper) and (
+            "DESCRIPCION" in upper or "DESCRIPCIÓN" in upper
+        ):
+            header_idx = i
+            header_cols = re.split(r"\s{2,}", ln)
+            header_cols = [c.strip() for c in header_cols if c.strip()]
+            break
+
+    if header_idx == -1 or not header_cols:
+        # No encontramos encabezado claro
+        return None
+
+    rows: List[Dict[str, str]] = []
+    # Procesamos desde la línea siguiente al encabezado
+    for ln in lines[header_idx + 1 :]:
+        upper = ln.upper()
+        # Cortar si parece que ya pasamos a otra sección
+        if any(
+            kw in upper
+            for kw in [
+                "CONDICIONES GENERALES",
+                "CONDICIONES CONTRACTUALES",
+                "CONDICIONES",
+                "REQUISITOS",
+                "OBLIGACIONES",
+                "PLAZO DE ENTREGA",
+                "PLAZO DE EJECUCION",
+                "PLAZO DE EJECUCIÓN",
+                "GARANTIAS",
+                "GARANTÍAS",
+                "FORMA DE PAGO",
+            ]
+        ):
+            break
+
+        # Dividir columnas por bloques de 2+ espacios
+        parts = re.split(r"\s{2,}", ln)
+        parts = [p.strip() for p in parts if p.strip()]
+        if not parts:
+            continue
+
+        # Si hay menos partes que columnas, rellenamos con vacío
+        if len(parts) < len(header_cols):
+            parts = parts + [""] * (len(header_cols) - len(parts))
+        # Si hay más partes, pegamos las extras en la última columna
+        if len(parts) > len(header_cols):
+            parts = parts[: len(header_cols) - 1] + [" ".join(parts[len(header_cols) - 1 :])]
+
+        row = {header_cols[i]: parts[i] for i in range(len(header_cols))}
+        rows.append(row)
+
+    return rows or None
+
+
+def extract_caracteristicas_from_pdf(pdf_path: str) -> Tuple[Optional[str], Optional[List[Dict[str, str]]]]:
+    """
+    Extrae del PDF:
+      - El bloque de texto correspondiente a 'CARACTERISTICAS TECNICAS'
+        (tolerando variantes con tilde).
+      - Una posible tabla estructurada a partir de ese bloque.
+
+    Retorna:
+      (segmento_texto, tabla_estructura)  donde:
+        - segmento_texto: str o None
+        - tabla_estructura: list[dict] o None
+    """
+    full_text = extract_text_from_pdf_with_ocr(pdf_path)
+    if not full_text:
+        return None, None
+
     normalized = full_text.upper()
 
     patterns = [
@@ -193,9 +329,9 @@ def extract_caracteristicas_from_pdf(pdf_path: str) -> Optional[str]:
 
     if start_idx == -1:
         print(f"ℹ️ No se encontró encabezado 'CARACTERISTICAS TECNICAS' en {pdf_path}")
-        return None
+        return None, None
 
-    # Buscar posible sección siguiente que marque el fin del bloque
+    # Detectar fin de la sección por palabras clave típicas
     end_markers = [
         "CONDICIONES GENERALES",
         "CONDICIONES CONTRACTUALES",
@@ -217,12 +353,14 @@ def extract_caracteristicas_from_pdf(pdf_path: str) -> Optional[str]:
             end_idx = min(end_idx, pos)
 
     segment = full_text[start_idx:end_idx].strip()
-    # Limitar el tamaño para que no sea gigantesco
-    max_len = 4000
+    max_len = 8000  # límite razonable
     if len(segment) > max_len:
         segment = segment[:max_len] + "\n[...]"
 
-    return segment
+    # Intentar parsear tabla
+    tabla = parse_caracteristicas_table(segment)
+
+    return segment, tabla
 
 
 async def debug_dump_page(page: Page, label: str = "after_search") -> None:
@@ -688,7 +826,7 @@ class PJScraper:
             () => {
                 const results = [];
                 function clean(t) {
-                    return t ? t.trim().replace(/\\s+/g, ' ') : '';
+                    return t ? t.trim().replace(/\s+/g, ' ') : '';
                 }
 
                 let rows = Array.from(document.querySelectorAll('table tbody tr'));
@@ -731,7 +869,9 @@ class PJScraper:
         Para una fila concreta:
         - Intenta localizar el elemento clicable del TDR.
         - Usa expect_download() para capturar el PDF.
-        - Extrae 'caracteristicas_tecnicas' del PDF.
+        - Aplica extracción + OCR:
+            * 'caracteristicas_tecnicas' -> texto del bloque.
+            * 'caracteristicas_tecnicas_tabla' -> lista de dicts (tabla).
         """
         try:
             clickable = row_locator.locator("a, button, img, span")
@@ -755,8 +895,8 @@ class PJScraper:
 
                 combined = " ".join([txt, alt, title, onclick]).lower()
 
+                # Evitar el típico "Ver" genérico sin contexto de TDR
                 if "ver" in txt and "pdf" not in combined and "tdr" not in combined:
-                    # Probable botón de "Ver", no forzamos descarga aquí
                     continue
 
                 if any(
@@ -794,12 +934,10 @@ class PJScraper:
             item["tdr_filename"] = suggested_name
             item["tdr_downloaded"] = True
 
-            # Extraer bloque de CARACTERISTICAS TECNICAS
-            block = extract_caracteristicas_from_pdf(tmp_path)
-            if block:
-                item["caracteristicas_tecnicas"] = block
-            else:
-                item["caracteristicas_tecnicas"] = None
+            # Extraer bloque + tabla (texto+OCR)
+            block, tabla = extract_caracteristicas_from_pdf(tmp_path)
+            item["caracteristicas_tecnicas"] = block
+            item["caracteristicas_tecnicas_tabla"] = tabla
 
         except Exception as e:
             print(f"⚠️ Error enriqueciendo fila con TDR: {e}")
