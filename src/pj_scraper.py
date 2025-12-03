@@ -15,22 +15,13 @@ Objetivo:
 - Si el CAPTCHA falló, reintentar varias veces (recargando página y nuevo CAPTCHA).
 - Cuando se obtenga una tabla con filas válidas:
     * Extraer todas las filas de la página.
+    * Configurar el selector de “registros por página” al máximo.
     * Recorrer páginas con "Siguiente".
     * Para cada fila:
         - Intentar localizar el elemento que descarga el TDR.
         - Usar page.expect_download() para capturar el PDF.
         - Extraer el bloque "CARACTERISTICAS TECNICAS" del PDF.
-        - Si el PDF es imagen, hacer OCR y volver a buscar el capítulo.
-    * Emitir UN SOLO JSON "procesado" para GitHub Actions (data/processed/*.json).
-    * En cada fila dejar:
-        - numero_convocatoria
-        - unidad_organica
-        - descripcion
-        - cierre_postulacion (texto original)
-        - cierre_postulacion_lima (ISO 8601 con tz America/Lima)
-        - tdr_filename (nombre del PDF descargado, si se logró)
-        - caracteristicas_tecnicas (bloque extraído del PDF, si se logró)
-        - caracteristicas_tecnicas_ocr (bool: True si se usó OCR)
+    * Guardar resultados en JSON (raw + procesado) para GitHub Actions.
 """
 
 import asyncio
@@ -39,11 +30,8 @@ import os
 import sys
 import io
 import re
-import subprocess
-import glob
-import tempfile
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from zoneinfo import ZoneInfo
 from playwright.async_api import async_playwright, Page
@@ -51,6 +39,7 @@ from playwright.async_api import async_playwright, Page
 from PIL import Image, ImageOps, ImageFilter
 import pytesseract
 from PyPDF2 import PdfReader
+
 
 URL = "https://sap.pj.gob.pe/portalabastecimiento-web/Convocatorias8uit"
 LIMA_TZ = ZoneInfo("America/Lima")
@@ -67,7 +56,7 @@ def _clean_text(text: str) -> str:
 
 def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
     """
-    Versión avanzada de OCR para el CAPTCHA:
+    Versión avanzada de OCR:
     - Varios preprocesados.
     - Varias configuraciones Tesseract.
     - Devuelve el mejor candidato (4–6 caracteres preferido).
@@ -121,7 +110,7 @@ def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
             except Exception as e:
                 attempts.append((desc, f"ERROR:{e}"))
 
-    print("📜 Intentos de OCR (CAPTCHA):")
+    print("📜 Intentos de OCR:")
     for desc, txt in attempts:
         if txt.startswith("ERROR:"):
             print(f"  [{desc}] -> {txt}")
@@ -130,7 +119,7 @@ def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
 
     best = ""
     # Preferimos cadenas de longitud 4–6 (tamaño típico de captcha)
-    for _, txt in attempts:
+    for desc, txt in attempts:
         if 4 <= len(txt) <= 6 and not txt.startswith("ERROR:"):
             best = txt
             break
@@ -143,40 +132,63 @@ def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
             best = max(candidates, key=len)
 
     if best:
-        print(f"✅ Mejor resultado OCR CAPTCHA: '{best}'")
+        print(f"✅ Mejor resultado OCR: '{best}'")
         return best
 
-    print("❌ No se obtuvo un resultado OCR usable para el CAPTCHA.")
+    print("❌ No se obtuvo un resultado OCR usable.")
     return None
 
 
-def _extract_caracteristicas_from_text(full_text: str) -> Optional[str]:
+def extract_caracteristicas_from_pdf(pdf_path: str) -> Optional[str]:
     """
-    Busca el capítulo de CARACTERÍSTICAS / ESPECIFICACIONES TÉCNICAS
-    dentro de un texto plano unido de todo el PDF.
+    Extrae el bloque de texto correspondiente a "CARACTERISTICAS TECNICAS"
+    (tolerando variantes con tilde) desde el PDF.
+
+    Retorna un string con ese bloque, recortado a un tamaño razonable.
     """
-    if not full_text:
+    try:
+        reader = PdfReader(pdf_path)
+    except Exception as e:
+        print(f"⚠️ No se pudo abrir PDF '{pdf_path}': {e}")
         return None
 
-    norm = full_text.upper()
+    texts: List[str] = []
+    for i, page in enumerate(reader.pages):
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        if t.strip():
+            texts.append(t)
 
-    # Encabezados posibles
+    if not texts:
+        print(f"⚠️ PDF sin texto legible: {pdf_path}")
+        return None
+
+    full_text = "\n".join(texts)
+    normalized = full_text.upper()
+
     patterns = [
-        r"CARACTER[IÍ]STICAS\s+T[ÉE]CNICAS",
-        r"ESPECIFICACIONES\s+T[ÉE]CNICAS",
+        "CARACTERISTICAS TECNICAS",
+        "CARACTERÍSTICAS TÉCNICAS",
+        "CARACTERISTICAS TÉCNICAS",
+        "CARACTERÍSTICAS TECNICAS",
     ]
 
     start_idx = -1
-    for pat in patterns:
-        m = re.search(pat, norm)
-        if m:
-            start_idx = m.start()
+    chosen = ""
+    for p in patterns:
+        pos = normalized.find(p)
+        if pos != -1:
+            start_idx = pos
+            chosen = p
             break
 
     if start_idx == -1:
+        print(f"ℹ️ No se encontró encabezado 'CARACTERISTICAS TECNICAS' en {pdf_path}")
         return None
 
-    # Marcadores de fin
+    # Buscar posible sección siguiente que marque el fin del bloque
     end_markers = [
         "CONDICIONES GENERALES",
         "CONDICIONES CONTRACTUALES",
@@ -193,110 +205,17 @@ def _extract_caracteristicas_from_text(full_text: str) -> Optional[str]:
 
     end_idx = len(full_text)
     for m in end_markers:
-        pos = norm.find(m, start_idx + 10)
+        pos = normalized.find(m, start_idx + len(chosen))
         if pos != -1 and pos > start_idx:
             end_idx = min(end_idx, pos)
 
     segment = full_text[start_idx:end_idx].strip()
-    if not segment:
-        return None
-
+    # Limitar el tamaño para que no sea gigantesco
     max_len = 4000
     if len(segment) > max_len:
         segment = segment[:max_len] + "\n[...]"
 
     return segment
-
-
-def extract_caracteristicas_from_pdf_plain(pdf_path: str) -> Optional[str]:
-    """
-    Intenta extraer el capítulo de características técnicas usando
-    SOLO texto embebido (PyPDF2).
-    """
-    try:
-        reader = PdfReader(pdf_path)
-    except Exception as e:
-        print(f"⚠️ No se pudo abrir PDF '{pdf_path}' (texto embebido): {e}")
-        return None
-
-    texts: List[str] = []
-    for i, page in enumerate(reader.pages):
-        try:
-            t = page.extract_text() or ""
-        except Exception:
-            t = ""
-        if t.strip():
-            texts.append(t)
-
-    if not texts:
-        print(f"ℹ️ PDF sin texto embebido legible: {pdf_path}")
-        return None
-
-    full_text = "\n".join(texts)
-    return _extract_caracteristicas_from_text(full_text)
-
-
-def ocr_pdf_to_text(pdf_path: str) -> str:
-    """
-    Convierte el PDF completo a imágenes (pdftoppm) y les aplica OCR (pytesseract).
-    Retorna texto concatenado de todas las páginas OCR.
-    """
-    texts: List[str] = []
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            prefix = os.path.join(tmpdir, "page")
-            # Requiere poppler-utils (pdftoppm)
-            subprocess.run(
-                ["pdftoppm", "-png", pdf_path, prefix],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            png_files = sorted(glob.glob(os.path.join(tmpdir, "page-*.png")))
-            for png in png_files:
-                try:
-                    img = Image.open(png).convert("L")
-                    img = img.filter(ImageFilter.MedianFilter(size=3))
-                    txt = pytesseract.image_to_string(img, lang="spa+eng")
-                    if txt.strip():
-                        texts.append(txt)
-                except Exception as e:
-                    print(f"⚠️ Error OCR en página {png}: {e}")
-    except Exception as e:
-        print(f"⚠️ Error en pipeline pdftoppm/OCR: {e}")
-
-    return "\n".join(texts).strip()
-
-
-def extract_caracteristicas_from_pdf_with_ocr(pdf_path: str) -> Tuple[Optional[str], bool]:
-    """
-    Extrae el capítulo de CARACTERÍSTICAS TÉCNICAS con dos etapas:
-
-    1) Texto embebido (PyPDF2).
-       - Si lo encuentra, retorna (segmento, False).
-
-    2) Si no lo encuentra, aplica OCR completo (pdftoppm + Tesseract).
-       - Si lo encuentra, retorna (segmento, True).
-       - Si no, retorna (None, True) para indicar que se intentó OCR.
-    """
-    # Etapa 1: texto embebido
-    segment_plain = extract_caracteristicas_from_pdf_plain(pdf_path)
-    if segment_plain:
-        return segment_plain, False
-
-    # Etapa 2: OCR
-    print(f"ℹ️ Activando OCR para extraer características técnicas de '{pdf_path}'...")
-    ocr_text = ocr_pdf_to_text(pdf_path)
-    if not ocr_text:
-        print("⚠️ OCR no devolvió texto útil.")
-        return None, True
-
-    segment_ocr = _extract_caracteristicas_from_text(ocr_text)
-    if segment_ocr:
-        return segment_ocr, True
-
-    print("⚠️ OCR ejecutado pero no se encontró el capítulo de características técnicas.")
-    return None, True
 
 
 async def debug_dump_page(page: Page, label: str = "after_search") -> None:
@@ -329,7 +248,7 @@ class PJScraper:
         headless: bool = True,
         timeout: int = 60,
         captcha_code: Optional[str] = None,
-        max_pages: int = 30,
+        max_pages: int = 200,          # aumentado para asegurar “todo” usando Siguiente
         max_captcha_attempts: int = 5,
         use_tesseract: bool = True,
     ) -> None:
@@ -711,7 +630,7 @@ class PJScraper:
     ) -> List[Dict[str, Any]]:
         """
         - Convierte cierre_postulacion -> cierre_postulacion_lima (ISO con tz).
-        - Ordena por fecha de cierre DESCENDENTE.
+        - Ordena por fecha de cierre DESCENDENTE (la más lejana/reciente primero).
         - Estandariza fecha_extraccion en hora Lima.
         """
         for item in rows:
@@ -727,12 +646,12 @@ class PJScraper:
 
             item["fecha_extraccion"] = run_ts.isoformat()
 
-        # Para orden descendente: los None al final -> datetime.min
+        # Para orden descendente: los None al final -> asignamos datetime.min
         default_dt = datetime.min.replace(tzinfo=LIMA_TZ)
         sorted_rows = sorted(
             rows,
             key=lambda x: x.get("_sort_cierre_dt") or default_dt,
-            reverse=True,
+            reverse=True,  # DESCENDENTE
         )
 
         for item in sorted_rows:
@@ -740,12 +659,83 @@ class PJScraper:
 
         return sorted_rows
 
+    # -------------------- Selector “registros por página” -------------------
+
+    async def set_page_size_max(self, page: Page) -> None:
+        """
+        Intenta cambiar el selector de 'número de registros por página'
+        al valor máximo disponible (o 'Todos', si existe).
+        """
+        try:
+            changed = await page.evaluate(
+                """
+                () => {
+                    const selects = Array.from(document.querySelectorAll('select'));
+                    for (const sel of selects) {
+                        const label = (
+                            (sel.id || '') + ' ' +
+                            (sel.name || '') + ' ' +
+                            (sel.className || '')
+                        ).toLowerCase();
+
+                        if (!label.includes('registros') &&
+                            !label.includes('rows') &&
+                            !label.includes('pagina') &&
+                            !label.includes('paginación') &&
+                            !label.includes('paginacion')) {
+                            continue;
+                        }
+
+                        let bestIndex = -1;
+                        let bestValue = 0;
+
+                        for (let i = 0; i < sel.options.length; i++) {
+                            const opt = sel.options[i];
+                            const text = (opt.textContent || '').trim().toLowerCase();
+                            const valStr = (opt.value || opt.textContent || '').trim();
+
+                            if (text.includes('todos') || text.includes('all')) {
+                                bestIndex = i;
+                                break;
+                            }
+
+                            const n = parseInt(valStr, 10);
+                            if (!Number.isNaN(n) && n > bestValue) {
+                                bestValue = n;
+                                bestIndex = i;
+                            }
+                        }
+
+                        if (bestIndex >= 0) {
+                            sel.selectedIndex = bestIndex;
+                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                """
+            )
+
+            if changed:
+                print("📑 Selector de registros por página ajustado al máximo disponible.")
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
+                    await asyncio.sleep(1)
+                except Exception:
+                    pass
+            else:
+                print("ℹ️ No se encontró selector de cantidad de registros por página.")
+        except Exception as e:
+            print(f"⚠️ Error intentando configurar tamaño de página: {e}")
+
     # -------------------------- Extracción DOM ------------------------------
 
     async def extract_page(self, page: Page) -> List[Dict[str, Any]]:
         """
         Extrae filas de la página actual (sin descargar PDFs todavía).
-        Añade _row_index_in_page para luego localizar la fila real.
+        Añade _row_index_in_page para luego poder localizar la fila real
+        y disparar la descarga desde Playwright.
         """
         print("📊 Extrayendo filas de la página actual...")
         try:
@@ -804,9 +794,7 @@ class PJScraper:
         Para una fila concreta:
         - Intenta localizar el elemento clicable del TDR.
         - Usa expect_download() para capturar el PDF.
-        - Extrae 'caracteristicas_tecnicas' del PDF (texto embebido).
-        - Si es None, aplica OCR y vuelve a intentar extraer.
-        - Marca caracteristicas_tecnicas_ocr = True si se usó OCR.
+        - Extrae 'caracteristicas_tecnicas' del PDF.
         """
         try:
             clickable = row_locator.locator("a, button, img, span")
@@ -830,8 +818,8 @@ class PJScraper:
 
                 combined = " ".join([txt, alt, title, onclick]).lower()
 
-                # Evitar botones "Ver" genéricos
                 if "ver" in txt and "pdf" not in combined and "tdr" not in combined:
+                    # Probable botón de "Ver", no forzamos descarga aquí
                     continue
 
                 if any(
@@ -848,6 +836,7 @@ class PJScraper:
                     break
 
             if candidate is None:
+                # No se encontró botón/ícono razonable para TDR
                 return
 
             print(f"📥 Intentando descargar TDR para {item.get('numero_convocatoria')}...")
@@ -868,10 +857,12 @@ class PJScraper:
             item["tdr_filename"] = suggested_name
             item["tdr_downloaded"] = True
 
-            # Extraer bloque de CARACTERISTICAS TECNICAS (texto + OCR fallback)
-            segment, used_ocr = extract_caracteristicas_from_pdf_with_ocr(tmp_path)
-            item["caracteristicas_tecnicas"] = segment
-            item["caracteristicas_tecnicas_ocr"] = bool(used_ocr)
+            # Extraer bloque de CARACTERISTICAS TECNICAS
+            block = extract_caracteristicas_from_pdf(tmp_path)
+            if block:
+                item["caracteristicas_tecnicas"] = block
+            else:
+                item["caracteristicas_tecnicas"] = None
 
         except Exception as e:
             print(f"⚠️ Error enriqueciendo fila con TDR: {e}")
@@ -887,6 +878,7 @@ class PJScraper:
             print(f"📄 Página {idx_page + 1}/{self.max_pages}")
             page_rows = await self.extract_page(page)
 
+            # Locator de filas reales en la página para mapear _row_index_in_page
             rows_locator = page.locator("table tbody tr")
             cnt = await rows_locator.count()
             if cnt == 0:
@@ -981,6 +973,9 @@ class PJScraper:
                         "error": "No se logró pasar CAPTCHA / obtener filas tras reintentos",
                     }
 
+                # NUEVO: ajustar selector de número de registros por página al máximo
+                await self.set_page_size_max(page)
+
                 rows_raw = await self.paginate_and_extract(page)
                 run_ts = datetime.now(LIMA_TZ)
                 rows = self.normalize_and_sort_convocatorias(rows_raw, run_ts)
@@ -1004,11 +999,6 @@ class PJScraper:
 # ---------------------------------------------------------------------------
 
 async def run_github() -> int:
-    """
-    Modo para GitHub Actions:
-    - Ejecuta el scraper en headless.
-    - Emite UN SOLO JSON procesado en data/processed/.
-    """
     captcha_code = os.getenv("CAPTCHA_CODE") or os.getenv("PJ_CAPTCHA")
     timeout_env = os.getenv("SCRAPER_TIMEOUT", "60")
     try:
@@ -1025,9 +1015,14 @@ async def run_github() -> int:
     )
     result = await scraper.run()
 
+    os.makedirs("data/raw", exist_ok=True)
     os.makedirs("data/processed", exist_ok=True)
 
     ts = datetime.now(LIMA_TZ).strftime("%Y%m%d_%H%M%S")
+
+    raw_file = f"data/raw/pj_8uit_raw_{ts}.json"
+    with open(raw_file, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
 
     convocatorias = result.get("convocatorias", [])
     total = result.get("total_convocatorias", len(convocatorias))
@@ -1047,7 +1042,8 @@ async def run_github() -> int:
     with open(proc_file, "w", encoding="utf-8") as f:
         json.dump(processed, f, indent=2, ensure_ascii=False)
 
-    print("📁 Archivo procesado guardado:")
+    print("📁 Archivos guardados:")
+    print(f"  RAW JSON:  {raw_file}")
     print(f"  PROC JSON: {proc_file}")
 
     return 0 if result.get("success") else 1
