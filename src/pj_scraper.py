@@ -2,34 +2,31 @@
 """
 PJ 8UIT Scraper
 
-Objetivo:
+Flujo general:
 - Abrir https://sap.pj.gob.pe/portalabastecimiento-web/Convocatorias8uit
-- Detectar CAPTCHA vía DOM.
-- Capturar la imagen del CAPTCHA y resolverla con Tesseract (OCR avanzado),
-  o usar un código fijo si viene por variable de entorno.
-- Escribir el CAPTCHA en el input.
-- Hacer clic en "Buscar" (con fallback via DOM).
-- Verificar si:
-    * el CAPTCHA fue incorrecto (mensaje en la página), o
-    * se cargó la tabla con filas de convocatorias.
-- Si el CAPTCHA falló, reintentar varias veces (recargando página y nuevo CAPTCHA).
-- Cuando se obtenga una tabla con filas válidas:
-    * Extraer todas las filas de la página.
-    * Configurar el selector de “registros por página” al máximo.
-    * Recorrer páginas con "Siguiente".
-    * Para cada fila:
-        - Intentar localizar el elemento que descarga el TDR.
-        - Usar page.expect_download() para capturar el PDF.
-        - Extraer el bloque "CARACTERISTICAS TECNICAS" del PDF.
-    * Guardar resultados en JSON (raw + procesado) para GitHub Actions.
+- Resolver CAPTCHA (Tesseract OCR o código fijo por env var).
+- Escribir el CAPTCHA en el input y hacer clic en "Buscar".
+- Reintentar si el CAPTCHA es incorrecto o no hay filas.
+- Una vez cargada la tabla:
+    * Recorrer todas las páginas de resultados (paginador con iconos "Next").
+    * Extraer, por fila:
+        - numero_convocatoria
+        - unidad_organica
+        - descripcion
+        - cierre_postulacion (texto original)
+    * Intentar localizar el botón/ícono de TDR y descargar el PDF.
+    * Extraer el bloque "CARACTERISTICAS TECNICAS" del PDF (si tiene texto).
+- Normalizar fechas a zona horaria America/Lima y ordenar por cierre descendente.
+- En modo GitHub:
+    * Guardar un único JSON procesado en data/processed/pj_8uit_tdr_YYYYMMDD_HHMMSS.json
 """
 
 import asyncio
+import io
 import json
 import os
-import sys
-import io
 import re
+import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -39,7 +36,6 @@ from playwright.async_api import async_playwright, Page
 from PIL import Image, ImageOps, ImageFilter
 import pytesseract
 from PyPDF2 import PdfReader
-
 
 URL = "https://sap.pj.gob.pe/portalabastecimiento-web/Convocatorias8uit"
 LIMA_TZ = ZoneInfo("America/Lima")
@@ -59,7 +55,7 @@ def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
     Versión avanzada de OCR:
     - Varios preprocesados.
     - Varias configuraciones Tesseract.
-    - Devuelve el mejor candidato (4–6 caracteres preferido).
+    - Devuelve el mejor candidato (prioriza longitud 4–6).
     """
     configs = [
         (
@@ -118,16 +114,13 @@ def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
             print(f"  [{desc}] -> '{txt}' (len={len(txt)})")
 
     best = ""
-    # Preferimos cadenas de longitud 4–6 (tamaño típico de captcha)
     for desc, txt in attempts:
         if 4 <= len(txt) <= 6 and not txt.startswith("ERROR:"):
             best = txt
             break
 
     if not best:
-        candidates = [
-            txt for _, txt in attempts if txt and not txt.startswith("ERROR:")
-        ]
+        candidates = [txt for _, txt in attempts if txt and not txt.startswith("ERROR:")]
         if candidates:
             best = max(candidates, key=len)
 
@@ -142,9 +135,8 @@ def solve_captcha_tesseract_advanced(image: Image.Image) -> Optional[str]:
 def extract_caracteristicas_from_pdf(pdf_path: str) -> Optional[str]:
     """
     Extrae el bloque de texto correspondiente a "CARACTERISTICAS TECNICAS"
-    (tolerando variantes con tilde) desde el PDF.
-
-    Retorna un string con ese bloque, recortado a un tamaño razonable.
+    (tolerando variantes con tilde) desde el PDF. Si no hay texto (PDF escaneado),
+    devolverá None.
     """
     try:
         reader = PdfReader(pdf_path)
@@ -188,7 +180,6 @@ def extract_caracteristicas_from_pdf(pdf_path: str) -> Optional[str]:
         print(f"ℹ️ No se encontró encabezado 'CARACTERISTICAS TECNICAS' en {pdf_path}")
         return None
 
-    # Buscar posible sección siguiente que marque el fin del bloque
     end_markers = [
         "CONDICIONES GENERALES",
         "CONDICIONES CONTRACTUALES",
@@ -210,7 +201,6 @@ def extract_caracteristicas_from_pdf(pdf_path: str) -> Optional[str]:
             end_idx = min(end_idx, pos)
 
     segment = full_text[start_idx:end_idx].strip()
-    # Limitar el tamaño para que no sea gigantesco
     max_len = 4000
     if len(segment) > max_len:
         segment = segment[:max_len] + "\n[...]"
@@ -248,7 +238,7 @@ class PJScraper:
         headless: bool = True,
         timeout: int = 60,
         captcha_code: Optional[str] = None,
-        max_pages: int = 200,          # aumentado para asegurar “todo” usando Siguiente
+        max_pages: int = 30,
         max_captcha_attempts: int = 5,
         use_tesseract: bool = True,
     ) -> None:
@@ -569,8 +559,7 @@ class PJScraper:
 
     def parse_cierre_postulacion(self, text: str) -> Optional[datetime]:
         """
-        Intenta extraer una fecha/hora de cierre.
-        Devuelve datetime con tz America/Lima o None.
+        Intenta extraer una fecha/hora de cierre y devolver datetime con tz America/Lima.
         """
         if not text:
             return None
@@ -630,7 +619,7 @@ class PJScraper:
     ) -> List[Dict[str, Any]]:
         """
         - Convierte cierre_postulacion -> cierre_postulacion_lima (ISO con tz).
-        - Ordena por fecha de cierre DESCENDENTE (la más lejana/reciente primero).
+        - Ordena por fecha de cierre DESCENDENTE.
         - Estandariza fecha_extraccion en hora Lima.
         """
         for item in rows:
@@ -646,12 +635,11 @@ class PJScraper:
 
             item["fecha_extraccion"] = run_ts.isoformat()
 
-        # Para orden descendente: los None al final -> asignamos datetime.min
         default_dt = datetime.min.replace(tzinfo=LIMA_TZ)
         sorted_rows = sorted(
             rows,
             key=lambda x: x.get("_sort_cierre_dt") or default_dt,
-            reverse=True,  # DESCENDENTE
+            reverse=True,
         )
 
         for item in sorted_rows:
@@ -659,83 +647,12 @@ class PJScraper:
 
         return sorted_rows
 
-    # -------------------- Selector “registros por página” -------------------
-
-    async def set_page_size_max(self, page: Page) -> None:
-        """
-        Intenta cambiar el selector de 'número de registros por página'
-        al valor máximo disponible (o 'Todos', si existe).
-        """
-        try:
-            changed = await page.evaluate(
-                """
-                () => {
-                    const selects = Array.from(document.querySelectorAll('select'));
-                    for (const sel of selects) {
-                        const label = (
-                            (sel.id || '') + ' ' +
-                            (sel.name || '') + ' ' +
-                            (sel.className || '')
-                        ).toLowerCase();
-
-                        if (!label.includes('registros') &&
-                            !label.includes('rows') &&
-                            !label.includes('pagina') &&
-                            !label.includes('paginación') &&
-                            !label.includes('paginacion')) {
-                            continue;
-                        }
-
-                        let bestIndex = -1;
-                        let bestValue = 0;
-
-                        for (let i = 0; i < sel.options.length; i++) {
-                            const opt = sel.options[i];
-                            const text = (opt.textContent || '').trim().toLowerCase();
-                            const valStr = (opt.value || opt.textContent || '').trim();
-
-                            if (text.includes('todos') || text.includes('all')) {
-                                bestIndex = i;
-                                break;
-                            }
-
-                            const n = parseInt(valStr, 10);
-                            if (!Number.isNaN(n) && n > bestValue) {
-                                bestValue = n;
-                                bestIndex = i;
-                            }
-                        }
-
-                        if (bestIndex >= 0) {
-                            sel.selectedIndex = bestIndex;
-                            sel.dispatchEvent(new Event('change', { bubbles: true }));
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-                """
-            )
-
-            if changed:
-                print("📑 Selector de registros por página ajustado al máximo disponible.")
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
-                    await asyncio.sleep(1)
-                except Exception:
-                    pass
-            else:
-                print("ℹ️ No se encontró selector de cantidad de registros por página.")
-        except Exception as e:
-            print(f"⚠️ Error intentando configurar tamaño de página: {e}")
-
     # -------------------------- Extracción DOM ------------------------------
 
     async def extract_page(self, page: Page) -> List[Dict[str, Any]]:
         """
         Extrae filas de la página actual (sin descargar PDFs todavía).
-        Añade _row_index_in_page para luego poder localizar la fila real
-        y disparar la descarga desde Playwright.
+        Añade _row_index_in_page para luego poder localizar la fila real.
         """
         print("📊 Extrayendo filas de la página actual...")
         try:
@@ -794,7 +711,7 @@ class PJScraper:
         Para una fila concreta:
         - Intenta localizar el elemento clicable del TDR.
         - Usa expect_download() para capturar el PDF.
-        - Extrae 'caracteristicas_tecnicas' del PDF.
+        - Extrae 'caracteristicas_tecnicas' del PDF (solo si tiene texto).
         """
         try:
             clickable = row_locator.locator("a, button, img, span")
@@ -819,7 +736,6 @@ class PJScraper:
                 combined = " ".join([txt, alt, title, onclick]).lower()
 
                 if "ver" in txt and "pdf" not in combined and "tdr" not in combined:
-                    # Probable botón de "Ver", no forzamos descarga aquí
                     continue
 
                 if any(
@@ -836,7 +752,6 @@ class PJScraper:
                     break
 
             if candidate is None:
-                # No se encontró botón/ícono razonable para TDR
                 return
 
             print(f"📥 Intentando descargar TDR para {item.get('numero_convocatoria')}...")
@@ -857,7 +772,6 @@ class PJScraper:
             item["tdr_filename"] = suggested_name
             item["tdr_downloaded"] = True
 
-            # Extraer bloque de CARACTERISTICAS TECNICAS
             block = extract_caracteristicas_from_pdf(tmp_path)
             if block:
                 item["caracteristicas_tecnicas"] = block
@@ -869,202 +783,25 @@ class PJScraper:
 
     async def paginate_and_extract(self, page: Page) -> List[Dict[str, Any]]:
         """
-        Recorre las páginas usando "Siguiente", acumulando filas.
+        Recorre las páginas usando el paginador (iconos 'Siguiente'), acumulando filas.
         Para cada fila intenta descargar y procesar el TDR.
         """
         all_rows: List[Dict[str, Any]] = []
+        last_first_key: Optional[str] = None
 
         for idx_page in range(self.max_pages):
             print(f"📄 Página {idx_page + 1}/{self.max_pages}")
+
             page_rows = await self.extract_page(page)
-
-            # Locator de filas reales en la página para mapear _row_index_in_page
-            rows_locator = page.locator("table tbody tr")
-            cnt = await rows_locator.count()
-            if cnt == 0:
-                rows_locator = page.locator("tbody tr")
-                cnt = await rows_locator.count()
-
-            for item in page_rows:
-                row_idx = item.get("_row_index_in_page")
-                if row_idx is None or row_idx >= cnt:
-                    continue
-
-                row_loc = rows_locator.nth(row_idx)
-                await self.enrich_row_with_tdr_pdf(page, row_loc, item)
-                item.pop("_row_index_in_page", None)
-                all_rows.append(item)
-
-            # Buscar botón "Siguiente"
-            next_selectors = [
-                'a[aria-label*="Siguiente"]',
-                'button[aria-label*="Siguiente"]',
-                'a:has-text("Siguiente")',
-                'button:has-text("Siguiente")',
-                'a:has-text("Sig.")',
-                'a[title*="Siguiente"]',
-            ]
-            next_btn = None
-            for sel in next_selectors:
-                try:
-                    cand = page.locator(sel).first
-                    if await cand.is_visible(timeout=2000):
-                        aria_dis = await cand.get_attribute("aria-disabled")
-                        disabled = await cand.get_attribute("disabled")
-                        if aria_dis in ("true", "1") or disabled is not None:
-                            continue
-                        next_btn = cand
-                        break
-                except Exception:
-                    continue
-
-            if not next_btn:
-                print("⏹️ No se encontró 'Siguiente' activo. Fin de paginación.")
+            if not page_rows:
+                print("⚠️ Sin filas en esta página. Fin de paginación.")
                 break
 
-            print("➡️ Avanzando a la siguiente página...")
-            try:
-                await next_btn.click()
-            except Exception as e:
-                print(f"⚠️ Error haciendo clic en Siguiente: {e}")
+            first_key = (page_rows[0].get("numero_convocatoria") or "").strip()
+            if last_first_key is not None and first_key == last_first_key:
+                print("⏹️ La primera fila es igual a la de la página anterior. Se asume fin de páginas.")
                 break
 
-            try:
-                await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
-                await asyncio.sleep(1)
-            except Exception:
-                pass
+            last_first_key = first_key
 
-        print(f"📊 Total filas acumuladas (sin normalizar): {len(all_rows)}")
-        return all_rows
-
-    # -------------------------- Ejecución ----------------------------------
-
-    async def run(self) -> Dict[str, Any]:
-        print("🚀 Iniciando scraper PJ 8UIT...")
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=self.headless,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-            page = await browser.new_page()
-            await self.setup_page(page)
-
-            try:
-                print(f"🌐 Navegando a: {self.url}")
-                await page.goto(self.url, timeout=self.timeout_ms)
-                await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
-                await self.handle_overlays(page)
-
-                ok = await self.solve_and_search_with_retries(page)
-                if not ok:
-                    print("❌ No se logró obtener tabla con filas tras reintentos.")
-                    now_lima = datetime.now(LIMA_TZ)
-                    return {
-                        "success": False,
-                        "timestamp": now_lima.isoformat(),
-                        "source_url": self.url,
-                        "total_convocatorias": 0,
-                        "convocatorias": [],
-                        "error": "No se logró pasar CAPTCHA / obtener filas tras reintentos",
-                    }
-
-                # NUEVO: ajustar selector de número de registros por página al máximo
-                await self.set_page_size_max(page)
-
-                rows_raw = await self.paginate_and_extract(page)
-                run_ts = datetime.now(LIMA_TZ)
-                rows = self.normalize_and_sort_convocatorias(rows_raw, run_ts)
-
-                result: Dict[str, Any] = {
-                    "success": True,
-                    "timestamp": run_ts.isoformat(),
-                    "source_url": self.url,
-                    "total_convocatorias": len(rows),
-                    "convocatorias": rows,
-                }
-                print(f"🎉 Scraping terminado. Total convocatorias: {len(rows)}")
-                return result
-
-            finally:
-                await browser.close()
-
-
-# ---------------------------------------------------------------------------
-# Wrappers para GitHub Actions y pruebas locales
-# ---------------------------------------------------------------------------
-
-async def run_github() -> int:
-    captcha_code = os.getenv("CAPTCHA_CODE") or os.getenv("PJ_CAPTCHA")
-    timeout_env = os.getenv("SCRAPER_TIMEOUT", "60")
-    try:
-        timeout_val = int(timeout_env)
-    except ValueError:
-        timeout_val = 60
-
-    scraper = PJScraper(
-        headless=True,
-        timeout=timeout_val,
-        captcha_code=captcha_code,
-        use_tesseract=True,
-        max_captcha_attempts=5,
-    )
-    result = await scraper.run()
-
-    os.makedirs("data/raw", exist_ok=True)
-    os.makedirs("data/processed", exist_ok=True)
-
-    ts = datetime.now(LIMA_TZ).strftime("%Y%m%d_%H%M%S")
-
-    raw_file = f"data/raw/pj_8uit_raw_{ts}.json"
-    with open(raw_file, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-
-    convocatorias = result.get("convocatorias", [])
-    total = result.get("total_convocatorias", len(convocatorias))
-
-    processed = {
-        "metadata": {
-            "source": "pj_8uit_convocatorias",
-            "extraction_timestamp": result.get(
-                "timestamp",
-                datetime.now(LIMA_TZ).isoformat()
-            ),
-            "total_records": total,
-        },
-        "convocatorias": convocatorias,
-    }
-    proc_file = f"data/processed/pj_8uit_tdr_{ts}.json"
-    with open(proc_file, "w", encoding="utf-8") as f:
-        json.dump(processed, f, indent=2, ensure_ascii=False)
-
-    print("📁 Archivos guardados:")
-    print(f"  RAW JSON:  {raw_file}")
-    print(f"  PROC JSON: {proc_file}")
-
-    return 0 if result.get("success") else 1
-
-
-async def run_local() -> None:
-    """Modo debug local (abre navegador visible)."""
-    scraper = PJScraper(
-        headless=False,
-        timeout=90,
-        captcha_code=None,
-        use_tesseract=True,
-        max_captcha_attempts=5,
-    )
-    result = await scraper.run()
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "github":
-        code = asyncio.run(run_github())
-        sys.exit(code)
-    else:
-        asyncio.run(run_local())
+            rows_locator = page.lo_
