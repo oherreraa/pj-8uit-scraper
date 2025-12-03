@@ -4,67 +4,54 @@ on:
   workflow_dispatch:
     inputs:
       captcha_code:
-        description: 'CAPTCHA fijo opcional (si lo quieres forzar)'
+        description: 'Captcha a usar (opcional, si el OCR falla puedes ponerlo manualmente)'
         required: false
         default: ''
-      timeout:
-        description: 'Timeout del scraper en segundos'
-        required: false
-        default: '90'
 
 jobs:
-  run-scraper:
+  scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    env:
-      # Pasamos parámetros al script vía variables de entorno
-      CAPTCHA_CODE: ${{ github.event.inputs.captcha_code }}
-      SCRAPER_TIMEOUT: ${{ github.event.inputs.timeout }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Instalar dependencias de sistema (Tesseract + Poppler + Xvfb)
+      - name: Install system dependencies (Tesseract, Poppler, Xvfb)
         run: |
-          sudo apt-get update -q
+          sudo apt-get update
           sudo apt-get install -y \
             tesseract-ocr \
-            tesseract-ocr-spa \
             poppler-utils \
             xvfb
 
-      - name: Instalar dependencias Python
+      - name: Install Python dependencies
         run: |
-          pip install --upgrade pip
-          pip install playwright pytesseract pillow PyPDF2
-          playwright install chromium
+          python -m pip install --upgrade pip
+          pip install \
+            playwright \
+            pytesseract \
+            pillow \
+            PyPDF2 \
+            pdf2image
+          python -m playwright install --with-deps chromium
 
-      - name: Lanzar Xvfb y ejecutar scraper
+      - name: Run PJ 8UIT scraper
+        env:
+          SCRAPER_TIMEOUT: 90
+          CAPTCHA_CODE: ${{ github.event.inputs.captcha_code }}
         run: |
           export DISPLAY=:99
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 3
-
-          # Ejecuta el scraper en modo GitHub (escribe JSON en data/raw y data/processed)
           python src/pj_scraper.py github
-        # Si quieres que el pipeline NO falle aunque el scraper devuelva código 1,
-        # puedes descomentar la siguiente línea:
-        # continue-on-error: true
 
-      - name: Subir JSON como artifact
-        if: always()
+      - name: Upload processed JSON
         uses: actions/upload-artifact@v4
         with:
-          name: pj-8uit-json-${{ github.run_number }}
-          # Solo carpetas donde el script guarda JSON
-          path: |
-            data/raw/*.json
-            data/processed/*.json
-          retention-days: 7
+          name: pj-8uit-scraper-json
+          path: data/processed/*.json
