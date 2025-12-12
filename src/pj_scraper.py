@@ -490,7 +490,7 @@ class PJScraper:
                 """
             )
             
-            return total_detected || 0
+            return total_detected or 0
             
         except Exception as e:
             print(f"⚠️ Error detectando total: {e}")
