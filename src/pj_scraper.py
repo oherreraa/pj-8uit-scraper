@@ -313,6 +313,27 @@ class PJScraper:
             "Accept-Language": "es-PE,es;q=0.9,en;q=0.8",
         }
 
+        # --- ADDED: regex central para botón "Aceptar y continuar" y variantes ---
+        self._consent_accept_rx = re.compile(
+            r"("
+            r"aceptar\s*y\s*continuar|"
+            r"aceptar\s+todo|"
+            r"aceptar\s+y\s+seguir|"
+            r"aceptar\s+y\s+cerrar|"
+            r"\baceptar\b|"
+            r"\bcontinuar\b|"
+            r"\bentendido\b|"
+            r"accept(\s+and\s+continue)?|"
+            r"accept\s+all|"
+            r"agree(\s+and\s+continue)?|"
+            r"i\s+agree|"
+            r"allow\s+all|"
+            r"got\s+it|"
+            r"\bok\b"
+            r")",
+            re.IGNORECASE,
+        )
+
     # ----------------------------- Setup -----------------------------------
 
     async def setup_page(self, page: Page) -> None:
@@ -328,9 +349,56 @@ class PJScraper:
             """
         )
 
+    # --- ADDED: manejo explícito del banner/modal "Aceptar y continuar" (y derivaciones) ---
+    async def accept_and_continue_if_present(self, page: Page, retries: int = 3) -> bool:
+        """
+        Busca un botón/enlace tipo 'Aceptar y continuar' (y variaciones) y le da click.
+        - Explora page + frames (muchos CMP/cookies se montan en iframes).
+        - Devuelve True si clickeó algo.
+        """
+        for _ in range(retries):
+            try:
+                contexts = [page] + list(page.frames)
+
+                # 1) Por role=button con name regex (más robusto si hay accesibilidad)
+                for ctx in contexts:
+                    try:
+                        btn = ctx.get_by_role("button", name=self._consent_accept_rx).first
+                        if await btn.is_visible(timeout=1200):
+                            await btn.click(timeout=2500)
+                            print("✅ Click en consentimiento: botón (role=button)")
+                            await asyncio.sleep(0.6)
+                            return True
+                    except Exception:
+                        pass
+
+                # 2) Fallback: elementos clickeables con texto
+                for ctx in contexts:
+                    try:
+                        loc = ctx.locator(
+                            "button, a, input[type='button'], input[type='submit']"
+                        ).filter(has_text=self._consent_accept_rx).first
+                        if await loc.is_visible(timeout=1200):
+                            await loc.click(timeout=2500)
+                            print("✅ Click en consentimiento: elemento clickeable (texto)")
+                            await asyncio.sleep(0.6)
+                            return True
+                    except Exception:
+                        pass
+
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.5)
+
+        return False
+
     async def handle_overlays(self, page: Page) -> None:
         """Cerrar modales / banners de cookies si aparecen."""
         try:
+            # --- ADDED: primero intentar cerrar explícitamente "Aceptar y continuar" ---
+            await self.accept_and_continue_if_present(page, retries=2)
+
             modal_selectors = [
                 ".modal:visible",
                 ".popup:visible",
@@ -363,6 +431,9 @@ class PJScraper:
                 except Exception:
                     continue
 
+            # --- ADDED: reintento final por si el banner aparece tras animación ---
+            await self.accept_and_continue_if_present(page, retries=1)
+
         except Exception as e:
             print(f"⚠️ Error manejando overlays: {e}")
 
@@ -373,37 +444,40 @@ class PJScraper:
         MEJORADO: Cierra modales SweetAlert2 y otros que interfieren con la navegación
         """
         try:
+            # --- ADDED: cerrar explícitamente "Aceptar y continuar" si aparece ---
+            await self.accept_and_continue_if_present(page, retries=1)
+
             # Lista de selectores para diferentes tipos de modales
             modal_selectors = [
                 '.swal2-container',
-                '.swal2-popup', 
+                '.swal2-popup',
                 '.swal2-backdrop-show',
                 '.modal:visible',
                 '.popup:visible',
                 '[role="dialog"]:visible',
                 '.overlay:visible'
             ]
-            
+
             for selector in modal_selectors:
                 try:
                     modal = page.locator(selector).first
                     if await modal.is_visible(timeout=1000):
                         print(f"🔴 Cerrando modal: {selector}")
-                        
+
                         # Intentar ESC primero
                         await page.keyboard.press("Escape")
                         await asyncio.sleep(0.3)
-                        
+
                         # Si persiste, buscar botón de cierre
                         if await modal.is_visible(timeout=500):
                             close_selectors = [
                                 '.swal2-close',
-                                '.swal2-cancel', 
+                                '.swal2-cancel',
                                 '[data-dismiss]',
                                 '.close',
                                 '.btn-close'
                             ]
-                            
+
                             for close_sel in close_selectors:
                                 try:
                                     close_btn = modal.locator(close_sel).first
@@ -412,14 +486,14 @@ class PJScraper:
                                         break
                                 except:
                                     continue
-                        
+
                         break  # Solo cerrar el primer modal encontrado
-                        
+
                 except:
                     continue
-                    
+
             await asyncio.sleep(0.2)  # Pequeña pausa para estabilizar
-            
+
         except Exception as e:
             # Error silencioso - no queremos que esto bloquee el flujo principal
             pass
@@ -431,29 +505,29 @@ class PJScraper:
         """
         try:
             await self.close_any_modals(page)
-            
+
             total_detected = await page.evaluate(
                 """
                 () => {
                     // Patrones para detectar total de registros
                     const patterns = [
                         /\\b(\\d+)\\s*-\\s*\\d+\\s*de\\s*(\\d+)\\b/i,     // "1 - 20 de 62"
-                        /\\b\\d+\\s*de\\s*(\\d+)\\s*registros?\\b/i,      // "20 de 62 registros"  
+                        /\\b\\d+\\s*de\\s*(\\d+)\\s*registros?\\b/i,      // "20 de 62 registros"
                         /\\btotal:?\\s*(\\d+)\\b/i,                       // "Total: 62"
                         /\\b(\\d+)\\s*registros?\\s*encontrados?\\b/i,    // "62 registros encontrados"
                         /\\bshowing\\s*\\d+-\\d+\\s*of\\s*(\\d+)/i,       // "Showing 1-20 of 62"
                         /\\d+\\s*\\/\\s*(\\d+)/                           // "20/62"
                     ];
-                    
+
                     // Buscar en todos los elementos visibles
                     const allElements = Array.from(document.querySelectorAll('*'));
                     const candidates = [];
-                    
+
                     for (const el of allElements) {
                         // Solo elementos visibles y con texto relevante
                         if (el.offsetHeight > 0 && el.offsetWidth > 0) {
                             const text = (el.innerText || el.textContent || '').trim();
-                            
+
                             if (text && text.length < 200) {  // Evitar textos muy largos
                                 for (const pattern of patterns) {
                                     const match = text.match(pattern);
@@ -471,7 +545,7 @@ class PJScraper:
                             }
                         }
                     }
-                    
+
                     // Retornar el candidato más probable
                     if (candidates.length > 0) {
                         // Ordenar por confianza (patrón más específico primero)
@@ -480,33 +554,33 @@ class PJScraper:
                             if (!a.text.includes('de') && b.text.includes('de')) return 1;
                             return b.total - a.total;  // Mayor número como fallback
                         });
-                        
+
                         console.log('Detected totals:', candidates.slice(0, 3));
                         return candidates[0].total;
                     }
-                    
+
                     return 0;
                 }
                 """
             )
-            
+
             return total_detected or 0
-            
+
         except Exception as e:
             print(f"⚠️ Error detectando total: {e}")
             return 0
 
     async def select_page_size_100_FIXED(self, page: Page) -> None:
         """
-        CORREGIDO: Intenta cambiar 'Registros por página' a 100 
+        CORREGIDO: Intenta cambiar 'Registros por página' a 100
         Basado en la interfaz real de Material Design
         """
         try:
             # Primero cerrar cualquier modal que pueda estar abierto
             await self.close_any_modals(page)
-            
+
             print("📏 Intentando cambiar a 100 registros por página...")
-            
+
             # Estrategia 1: Buscar el dropdown específico de "Registros por página"
             page_size_selectors = [
                 # Selector específico del dropdown de Material Design
@@ -519,7 +593,7 @@ class PJScraper:
                 '.mat-select',
                 'select',
             ]
-            
+
             dropdown_clicked = False
             for sel in page_size_selectors:
                 try:
@@ -535,11 +609,11 @@ class PJScraper:
                 except Exception as e:
                     print(f"⚠️ Error con selector {sel}: {str(e)[:50]}...")
                     continue
-            
+
             if dropdown_clicked:
                 print("✅ Dropdown abierto, buscando opción '100'...")
                 await asyncio.sleep(2)  # Esperar a que aparezcan las opciones
-                
+
                 # Buscar la opción "100" en el dropdown abierto
                 option_selectors = [
                     'mat-option:has-text("100")',
@@ -548,7 +622,7 @@ class PJScraper:
                     'div[role="option"]:has-text("100")',
                     '[role="option"]:has-text("100")',
                 ]
-                
+
                 option_clicked = False
                 for opt_sel in option_selectors:
                     try:
@@ -560,7 +634,7 @@ class PJScraper:
                             break
                     except Exception:
                         continue
-                
+
                 if not option_clicked:
                     print("⚠️ No se encontró opción '100', intentando JavaScript...")
                     await page.evaluate(
@@ -578,7 +652,7 @@ class PJScraper:
                         }
                         """
                     )
-            
+
             # Estrategia 2: JavaScript directo si la estrategia 1 falla
             if not dropdown_clicked:
                 print("🔍 Intentando estrategia JavaScript para dropdown...")
@@ -587,16 +661,16 @@ class PJScraper:
                     () => {
                         // Buscar dropdown de registros por página
                         const dropdowns = Array.from(document.querySelectorAll('.mat-select, .mat-mdc-select, select'));
-                        
+
                         for (const dropdown of dropdowns) {
-                            const parent = dropdown.closest('[class*="paginator"], [class*="pagination"]') || 
+                            const parent = dropdown.closest('[class*="paginator"], [class*="pagination"]') ||
                                          dropdown.parentElement;
                             const parentText = (parent?.innerText || '').toLowerCase();
-                            
+
                             if (parentText.includes('registros') && parentText.includes('página')) {
                                 console.log('Found page size dropdown:', dropdown);
                                 dropdown.click();
-                                
+
                                 // Esperar un poco y buscar la opción 100
                                 setTimeout(() => {
                                     const options = Array.from(document.querySelectorAll('[role="option"], .mat-option, .mat-mdc-option'));
@@ -607,7 +681,7 @@ class PJScraper:
                                         }
                                     }
                                 }, 1000);
-                                
+
                                 return true;
                             }
                         }
@@ -615,18 +689,18 @@ class PJScraper:
                     }
                     """
                 )
-                
+
                 if success:
                     print("✅ Dropdown encontrado vía JavaScript")
-            
+
             # Esperar a que la tabla se recargue con 100 registros
             print("⏱️ Esperando a que la tabla se recargue con 100 registros...")
             await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
             await asyncio.sleep(3)  # Espera adicional para estabilizar
             await self.close_any_modals(page)  # Cerrar modales post-operación
-            
+
             print("✅ Intento de establecer 100 registros por página completado.")
-            
+
         except Exception as e:
             print(f"⚠️ No se pudo ajustar 'Registros por página' a 100: {e}")
             print("ℹ️ Continuando con configuración actual...")
@@ -644,82 +718,82 @@ class PJScraper:
             'button[class*="next"]:not([disabled]):not([aria-disabled="true"])',
             'button[class*="paginator"]:not([disabled]):not([aria-disabled="true"])'
         ]
-        
+
         print("🔍 Buscando flecha 'siguiente página'...")
-        
+
         # Estrategia 1: Locators de Playwright
         for selector in arrow_selectors:
             try:
                 await self.close_any_modals(page)
-                
+
                 arrow_btn = page.locator(selector).first
                 if await arrow_btn.is_visible(timeout=3000):
                     # Verificar que no esté deshabilitado
                     disabled = await arrow_btn.get_attribute("disabled")
                     aria_disabled = await arrow_btn.get_attribute("aria-disabled")
-                    
+
                     if disabled is None and aria_disabled != "true":
                         print(f"➡️ Encontrada flecha activa: {selector}")
-                        
+
                         await arrow_btn.scroll_into_view_if_needed()
                         await asyncio.sleep(0.5)
                         await arrow_btn.click()
-                        
+
                         print("⏱️ ESPERANDO 10 SEGUNDOS (navegación)...")
                         await asyncio.sleep(10)
                         return True
                     else:
                         print(f"⚠️ Flecha deshabilitada: {selector}")
-                
+
             except Exception as e:
                 print(f"⚠️ Error con selector {selector}: {str(e)[:40]}...")
                 continue
-        
+
         # Estrategia 2: JavaScript como fallback
         try:
             print("🔍 Intentando JavaScript para navegación...")
             await self.close_any_modals(page)
-            
+
             clicked = await page.evaluate(
                 """
                 () => {
                     // Limpiar modales SweetAlert2
                     document.querySelectorAll('.swal2-container').forEach(el => el.remove());
-                    
+
                     // Buscar botones de navegación
                     const buttons = Array.from(document.querySelectorAll('button'));
-                    
+
                     for (const btn of buttons) {
                         const classes = btn.className || '';
                         const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
-                        
+
                         if ((classes.includes('mat-mdc-paginator-navigation-next') ||
                              classes.includes('navigation-next') ||
                              ariaLabel.includes('siguiente') ||
                              ariaLabel.includes('next')) &&
-                            !btn.disabled && 
+                            !btn.disabled &&
                             btn.getAttribute('aria-disabled') !== 'true') {
-                            
+
                             console.log('Clicking navigation button:', btn.className);
                             btn.click();
                             return true;
                         }
                     }
-                    
+
                     return false;
                 }
                 """
             )
-            
+
             if clicked:
                 print("✅ Navegación exitosa vía JavaScript")
                 print("⏱️ ESPERANDO 10 SEGUNDOS (navegación JS)...")
                 await asyncio.sleep(10)
                 return True
-            
+
         except Exception as e:
             print(f"⚠️ Error en navegación JavaScript: {e}")
-        
+
         print("❌ No se encontró flecha de navegación activa")
         return False
 
@@ -729,34 +803,34 @@ class PJScraper:
         """
         LÓGICA INTELIGENTE según Oscar:
         1. Detectar total de registros disponibles
-        2. Cambiar a 100 registros por página  
+        2. Cambiar a 100 registros por página
         3. Esperar 10 segundos para estabilizar
         4. Procesar cada página descargando todos los TDRs
         5. Si hay más páginas (total > registros procesados), navegar y repetir
         6. Terminar cuando se hayan procesado todos los registros
         """
         print("🧠 === INICIANDO PAGINACIÓN INTELIGENTE ===")
-        
+
         # PASO 1: DETECTAR TOTAL DE REGISTROS DISPONIBLES
         print("📊 PASO 1: Detectando total de registros...")
         total_registros = await self.detect_total_records(page)
-        
+
         if total_registros == 0:
             print("❌ No se detectaron registros. Asumiendo procesamiento manual.")
             total_registros = 999  # Procesar hasta encontrar fin natural
         else:
             print(f"✅ TOTAL DETECTADO: {total_registros} registros")
-        
+
         # PASO 2: CAMBIAR A 100 REGISTROS POR PÁGINA
         print("📏 PASO 2: Cambiando a 100 registros por página...")
         await self.close_any_modals(page)
         await self.select_page_size_100_FIXED(page)
-        
+
         # PASO 3: ESPERAR 10 SEGUNDOS
         print("⏱️ PASO 3: Esperando 10 segundos para estabilizar...")
         await asyncio.sleep(10)
         await self.close_any_modals(page)
-        
+
         # CALCULAR PÁGINAS NECESARIAS
         if total_registros == 999:
             paginas_estimadas = "desconocido"
@@ -764,25 +838,25 @@ class PJScraper:
         else:
             max_paginas = max(1, (total_registros + 99) // 100)  # Redondear hacia arriba
             paginas_estimadas = max_paginas
-            
+
         print(f"📄 PÁGINAS ESTIMADAS: {paginas_estimadas}")
-        
+
         all_rows: List[Dict[str, Any]] = []
         pagina_actual = 1
-        
+
         # PASO 4: PROCESAR PÁGINAS SECUENCIALMENTE
         while pagina_actual <= max_paginas:
             print(f"\n🔄 === PROCESANDO PÁGINA {pagina_actual} ===")
-            
+
             # Limpiar modales antes de procesar
             await self.close_any_modals(page)
-            
+
             # Verificar estado actual de la página
             page_info = await self.verify_current_page_info(page, pagina_actual)
-            
+
             # Extraer filas de la página actual
             page_rows = await self.extract_page(page)
-            
+
             if not page_rows:
                 print("⚠️ No hay filas en esta página.")
                 if pagina_actual == 1:
@@ -791,58 +865,58 @@ class PJScraper:
                 else:
                     print("✅ Fin natural de datos. Terminando procesamiento.")
                     break
-            
+
             print(f"📋 FILAS ENCONTRADAS: {len(page_rows)}")
-            
+
             # Procesar cada fila de la página (descargar TDRs)
             successful_downloads = await self.process_all_page_rows(page, page_rows)
-            
+
             # Agregar filas procesadas al resultado final
             for item in page_rows:
                 item.pop("_row_index_in_page", None)
                 all_rows.append(item)
-            
+
             print(f"✅ PÁGINA {pagina_actual} COMPLETADA: {len(page_rows)} registros | {successful_downloads} TDRs descargados")
-            
+
             # PASO 5: DECIDIR SI CONTINUAR A SIGUIENTE PÁGINA
             registros_procesados = len(all_rows)
-            
+
             # Condición de parada mejorada
             if total_registros != 999 and registros_procesados >= total_registros:
                 print(f"🎯 TODOS LOS REGISTROS PROCESADOS: {registros_procesados}/{total_registros}")
                 break
-            
+
             if pagina_actual >= max_paginas:
                 print("🎯 LÍMITE DE PÁGINAS ALCANZADO")
                 break
-                
+
             # Si hay más registros por procesar, navegar a siguiente página
             print(f"➡️ HAY MÁS REGISTROS. Navegando a página {pagina_actual + 1}...")
-            
+
             await self.close_any_modals(page)
             next_success = await self.try_next_page_robust(page)
-            
+
             if not next_success:
                 print("❌ No se pudo navegar a la siguiente página. Finalizando.")
                 break
-            
+
             print("✅ Navegación exitosa. Esperando carga...")
-            
+
             # Esperar carga de la nueva página
             try:
                 await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
                 await asyncio.sleep(2)  # Estabilización adicional
             except Exception as e:
                 print(f"⚠️ Warning durante carga: {e}")
-                
+
             pagina_actual += 1
-        
+
         print(f"\n🎉 === PROCESAMIENTO COMPLETADO ===")
         print(f"📊 RESULTADO FINAL:")
         print(f"   • Registros esperados: {total_registros}")
         print(f"   • Registros obtenidos: {len(all_rows)}")
         print(f"   • Páginas procesadas: {pagina_actual}")
-        
+
         return all_rows
 
     async def verify_current_page_info(self, page: Page, expected_page: int) -> dict:
@@ -854,36 +928,36 @@ class PJScraper:
                 """
                 () => {
                     const allElements = Array.from(document.querySelectorAll('*'));
-                    
+
                     for (const el of allElements) {
                         if (el.offsetHeight > 0 && el.offsetWidth > 0) {
                             const text = (el.innerText || '').trim();
-                            
+
                             // Buscar patrón "X - Y de Z"
                             const match = text.match(/(\\d+)\\s*-\\s*(\\d+)\\s*de\\s*(\\d+)/i);
                             if (match) {
                                 return {
                                     desde: parseInt(match[1]),
-                                    hasta: parseInt(match[2]), 
+                                    hasta: parseInt(match[2]),
                                     total: parseInt(match[3]),
                                     text: text.substring(0, 100)
                                 };
                             }
                         }
                     }
-                    
+
                     return null;
                 }
                 """
             )
-            
+
             if page_info:
                 print(f"📄 Página {expected_page}: {page_info['desde']}-{page_info['hasta']} de {page_info['total']}")
                 return page_info
             else:
                 print(f"📄 Página {expected_page}: Info de rango no disponible")
                 return {}
-                
+
         except Exception as e:
             print(f"⚠️ Error verificando página: {e}")
             return {}
@@ -895,41 +969,41 @@ class PJScraper:
         """
         if not page_rows:
             return 0
-        
+
         print(f"📥 Procesando {len(page_rows)} filas de la página...")
-        
+
         # Obtener locators de filas
         rows_locator = page.locator("table tbody tr")
         cnt = await rows_locator.count()
         if cnt == 0:
             rows_locator = page.locator("tbody tr")
             cnt = await rows_locator.count()
-        
+
         successful_downloads = 0
-        
+
         for idx, item in enumerate(page_rows):
             row_idx = item.get("_row_index_in_page")
             if row_idx is None or row_idx >= cnt:
                 continue
-            
+
             row_loc = rows_locator.nth(row_idx)
             numero = item.get('numero_convocatoria', f'Fila-{idx+1}')
-            
+
             print(f"  📄 {idx+1}/{len(page_rows)}: {numero}")
-            
+
             # Cerrar modales antes de cada operación
             await self.close_any_modals(page)
-            
+
             # Intentar descarga con manejo de errores
             try:
                 await self.enrich_row_with_tdr_pdf_IMPROVED(page, row_loc, item)
-                
+
                 if item.get("tdr_downloaded"):
                     successful_downloads += 1
                     print(f"    ✅ TDR descargado: {item.get('tdr_filename', 'N/A')}")
                 else:
                     print(f"    ⚠️ TDR no disponible")
-                    
+
             except Exception as e:
                 print(f"    ❌ Error: {str(e)[:60]}...")
                 # Marcar como fallo pero continuar
@@ -937,7 +1011,7 @@ class PJScraper:
                 item["tdr_filename"] = None
                 item["caracteristicas_tecnicas"] = None
                 item["caracteristicas_tecnicas_ocr"] = False
-        
+
         print(f"  📊 Resumen: {successful_downloads}/{len(page_rows)} TDRs exitosos")
         return successful_downloads
 
@@ -1003,6 +1077,10 @@ class PJScraper:
         SOLO UN INTENTO; el bucle de reintentos está en solve_and_search_with_retries().
         """
         print(f"🎯 Intento de búsqueda con CAPTCHA #{attempt}")
+
+        # --- ADDED: antes de tocar CAPTCHA/botones, cerrar el consentimiento si está bloqueando ---
+        await self.accept_and_continue_if_present(page, retries=2)
+        await self.close_any_modals(page)
 
         if not await self.has_captcha(page):
             print("ℹ️ No se detectó CAPTCHA, continuando sin resolverlo.")
@@ -1166,7 +1244,13 @@ class PJScraper:
                 print("🔄 Re-cargando página para nuevo intento de CAPTCHA...")
                 await page.goto(self.url, timeout=self.timeout_ms)
                 await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
+
+                # --- ADDED: cerrar consentimiento/modales en cada recarga ---
+                await self.accept_and_continue_if_present(page, retries=3)
                 await self.handle_overlays(page)
+
+            # --- ADDED: antes del intento, por si el banner aparece con delay ---
+            await self.accept_and_continue_if_present(page, retries=2)
 
             await self.fill_captcha_and_click_search_once(page, attempt)
             status = await self.check_search_result_status(page)
@@ -1345,7 +1429,7 @@ class PJScraper:
         try:
             # Cerrar modales antes de intentar click
             await self.close_any_modals(page)
-            
+
             clickable = row_locator.locator("a, button, img, span")
             n = await clickable.count()
             if n == 0:
@@ -1375,7 +1459,7 @@ class PJScraper:
                     for kw in [
                         "tdr",
                         "especificacion",
-                        "especificación", 
+                        "especificación",
                         "caracteristica tecnica",
                         "característica técnica",
                     ]
@@ -1387,7 +1471,7 @@ class PJScraper:
                 return
 
             print(f"📥 Intentando descargar TDR para {item.get('numero_convocatoria')}...")
-            
+
             # TIMEOUT REDUCIDO PARA EVITAR BLOQUEOS
             try:
                 async with page.expect_download(timeout=30000) as dl_info:  # 30s en lugar de 90s
@@ -1434,6 +1518,10 @@ class PJScraper:
                 print(f"🌐 Navegando a: {self.url}")
                 await page.goto(self.url, timeout=self.timeout_ms)
                 await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
+
+                # --- ADDED: cerrar "Aceptar y continuar" ANTES de overlays/captcha ---
+                await self.accept_and_continue_if_present(page, retries=4)
+
                 await self.handle_overlays(page)
 
                 ok = await self.solve_and_search_with_retries(page)
